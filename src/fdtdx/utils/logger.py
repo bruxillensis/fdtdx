@@ -1,6 +1,7 @@
 import atexit
 import csv
 import shutil
+import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -67,20 +68,25 @@ def _log_formatter(record: Any) -> str:
     )
 
 
-def snapshot_python_files(snapshot_dir: Path):
+def snapshot_python_files(snapshot_dir: Path, save_fdtdx: bool=False, save_script: bool=True):
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     # fdtdx
     root_dir = Path(__file__).parent.parent
-    files = list(root_dir.rglob("*.py"))
-    # scripts
-    scripts_dir = Path(__file__).parent.parent.parent / "scripts"
-    files = files + list(scripts_dir.rglob("*.py"))
+    files = []
+
+    if save_fdtdx:
+        files = files + list(root_dir.rglob("*.py"))
 
     for python_file in files:
         relative_path = python_file.relative_to(root_dir.parent)
         destination = snapshot_dir / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(python_file, destination)
+
+    # Copy active script
+    if save_script and sys.argv[0]:
+        shutil.copy(sys.argv[0],snapshot_dir / Path(sys.argv[0]).name )
+
     # make zip and delete directory
     shutil.make_archive(str(snapshot_dir.parent / "code"), "zip", snapshot_dir)
     shutil.rmtree(snapshot_dir)
