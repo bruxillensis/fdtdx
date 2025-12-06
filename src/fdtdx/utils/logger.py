@@ -68,13 +68,13 @@ def _log_formatter(record: Any) -> str:
     )
 
 
-def snapshot_python_files(snapshot_dir: Path, save_fdtdx: bool=False, save_script: bool=True):
+def snapshot_python_files(snapshot_dir: Path, save_source: bool=False, save_script: bool=True):
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     # fdtdx
     root_dir = Path(__file__).parent.parent
     files = []
 
-    if save_fdtdx:
+    if save_source:
         files = files + list(root_dir.rglob("*.py"))
 
     for python_file in files:
@@ -105,7 +105,7 @@ class Logger:
         name (str | None, optional): Optional specific name for the working directory. If None, uses timestamp.
     """
 
-    def __init__(self, experiment_name: str, name: str | None = None):
+    def __init__(self, experiment_name: str, name: str | None = None, save_source: bool=False, save_script: bool=True):
         sns.set_theme(context="paper", style="white", palette="colorblind")
         self.cwd = init_working_directory(experiment_name, wd_name=name)
         self.console = Console()
@@ -129,7 +129,7 @@ class Logger:
             format="{time:DD.MM.YYYY HH:mm:ss:ssss} | {level} - {message}",
         )
         logger.info(f"Starting experiment {experiment_name} in {self.cwd}")
-        snapshot_python_files(self.cwd / "code")
+        snapshot_python_files(self.cwd / "code", save_source=save_source, save_script=save_script)
         self.fieldnames = None
         self.writer = None
         self.csvfile = open(self.cwd / "metrics.csv", "w", newline="")
