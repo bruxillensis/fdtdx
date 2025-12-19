@@ -313,3 +313,244 @@ def test_polygon_to_mask_large_polygon():
     # All points should be inside
     assert np.all(mask)
     assert mask.shape == (3, 3)
+
+
+def test_calculate_time_offset_yee_4d_permittivity_isotropic():
+    """Test calculate_time_offset_yee with 4D isotropic permittivity array.
+
+    Tests the code path for 4D permittivity with shape (1, Nx, Ny, Nz).
+    """
+    center = jnp.array([1.0, 1.0])
+    wave_vector = jnp.array([1.0, 0.0, 0.0])
+    resolution = 0.1
+    time_step_duration = 1e-15
+
+    # 4D isotropic permittivity: shape (1, Nx, Ny, Nz)
+    inv_permittivities = jnp.ones((1, 3, 3, 1)) * 0.25  # eps = 4
+
+    inv_permeabilities = 1.0
+    e_polarization = jnp.array([0.0, 1.0, 0.0])
+    h_polarization = jnp.array([0.0, 0.0, 1.0])
+
+    time_offset_E, time_offset_H = calculate_time_offset_yee(
+        center,
+        wave_vector,
+        inv_permittivities,
+        inv_permeabilities,
+        resolution,
+        time_step_duration,
+        e_polarization=e_polarization,
+        h_polarization=h_polarization,
+    )
+
+    # Check shapes
+    assert time_offset_E.shape == (3, 3, 3, 1)
+    assert time_offset_H.shape == (3, 3, 3, 1)
+
+    # Check that results are finite
+    assert jnp.all(jnp.isfinite(time_offset_E))
+    assert jnp.all(jnp.isfinite(time_offset_H))
+
+
+def test_calculate_time_offset_yee_4d_permittivity_isotropic_without_polarization():
+    """Test that 4D isotropic permittivity raises error without polarization."""
+    center = jnp.array([1.0, 1.0])
+    wave_vector = jnp.array([1.0, 0.0, 0.0])
+    resolution = 0.1
+    time_step_duration = 1e-15
+
+    # 4D isotropic permittivity: shape (1, Nx, Ny, Nz)
+    inv_permittivities = jnp.ones((1, 3, 3, 1)) * 0.25
+
+    inv_permeabilities = 1.0
+
+    # Without polarization for 4D array, should raise ValueError
+    with pytest.raises(ValueError, match="e_polarization is required"):
+        calculate_time_offset_yee(
+            center,
+            wave_vector,
+            inv_permittivities,
+            inv_permeabilities,
+            resolution,
+            time_step_duration,
+        )
+
+
+def test_calculate_time_offset_yee_4d_permeability_isotropic():
+    """Test calculate_time_offset_yee with 4D isotropic permeability array."""
+    center = jnp.array([1.0, 1.0])
+    wave_vector = jnp.array([1.0, 0.0, 0.0])
+    resolution = 0.1
+    time_step_duration = 1e-15
+
+    # 3D permittivity
+    inv_permittivities = jnp.ones((3, 3, 1)) * 0.25
+
+    # 4D isotropic permeability: shape (1, Nx, Ny, Nz)
+    inv_permeabilities = jnp.ones((1, 3, 3, 1)) * 0.5  # mu = 2
+
+    h_polarization = jnp.array([0.0, 0.0, 1.0])
+
+    time_offset_E, time_offset_H = calculate_time_offset_yee(
+        center,
+        wave_vector,
+        inv_permittivities,
+        inv_permeabilities,
+        resolution,
+        time_step_duration,
+        h_polarization=h_polarization,
+    )
+
+    # Check shapes
+    assert time_offset_E.shape == (3, 3, 3, 1)
+    assert time_offset_H.shape == (3, 3, 3, 1)
+
+    # Check that results are finite
+    assert jnp.all(jnp.isfinite(time_offset_E))
+    assert jnp.all(jnp.isfinite(time_offset_H))
+
+
+def test_calculate_time_offset_yee_4d_permeability_without_h_polarization():
+    """Test that 4D permeability raises error without h_polarization."""
+    center = jnp.array([1.0, 1.0])
+    wave_vector = jnp.array([1.0, 0.0, 0.0])
+    resolution = 0.1
+    time_step_duration = 1e-15
+
+    inv_permittivities = jnp.ones((3, 3, 1))
+    # 4D permeability
+    inv_permeabilities = jnp.ones((1, 3, 3, 1)) * 0.5
+
+    # Without h_polarization for 4D permeability, should raise ValueError
+    with pytest.raises(ValueError, match="h_polarization is required"):
+        calculate_time_offset_yee(
+            center,
+            wave_vector,
+            inv_permittivities,
+            inv_permeabilities,
+            resolution,
+            time_step_duration,
+        )
+
+
+def test_calculate_time_offset_yee_propagation_axis_0():
+    """Test calculate_time_offset_yee with propagation along axis 0 (x-axis)."""
+    center = jnp.array([2.0, 3.0])
+    wave_vector = jnp.array([1.0, 0.0, 0.0])
+    inv_permittivities = jnp.ones((1, 5, 6))  # shape (Nx=1, Ny=5, Nz=6)
+    inv_permeabilities = 1.0
+    resolution = 0.1
+    time_step_duration = 1e-15
+
+    time_offset_E, time_offset_H = calculate_time_offset_yee(
+        center, wave_vector, inv_permittivities, inv_permeabilities, resolution, time_step_duration
+    )
+
+    # Check shapes - should match input spatial shape
+    assert time_offset_E.shape == (3, 1, 5, 6)
+    assert time_offset_H.shape == (3, 1, 5, 6)
+
+    # Check that results are finite
+    assert jnp.all(jnp.isfinite(time_offset_E))
+    assert jnp.all(jnp.isfinite(time_offset_H))
+
+
+def test_calculate_time_offset_yee_propagation_axis_1():
+    """Test calculate_time_offset_yee with propagation along axis 1 (y-axis)."""
+    center = jnp.array([2.0, 3.0])
+    wave_vector = jnp.array([0.0, 1.0, 0.0])
+    inv_permittivities = jnp.ones((5, 1, 6))  # shape (Nx=5, Ny=1, Nz=6)
+    inv_permeabilities = 1.0
+    resolution = 0.1
+    time_step_duration = 1e-15
+
+    time_offset_E, time_offset_H = calculate_time_offset_yee(
+        center, wave_vector, inv_permittivities, inv_permeabilities, resolution, time_step_duration
+    )
+
+    # Check shapes - should match input spatial shape
+    assert time_offset_E.shape == (3, 5, 1, 6)
+    assert time_offset_H.shape == (3, 5, 1, 6)
+
+    # Check that results are finite
+    assert jnp.all(jnp.isfinite(time_offset_E))
+    assert jnp.all(jnp.isfinite(time_offset_H))
+
+
+def test_calculate_time_offset_yee_no_singleton_axis_raises():
+    """Test that missing singleton axis in spatial shape raises exception."""
+    center = jnp.array([1.0, 1.0])
+    wave_vector = jnp.array([1.0, 0.0, 0.0])
+    # No singleton axis in shape
+    inv_permittivities = jnp.ones((3, 3, 3))
+    inv_permeabilities = 1.0
+    resolution = 0.1
+    time_step_duration = 1e-15
+
+    with pytest.raises(Exception, match="Expected one spatial axis to be one"):
+        calculate_time_offset_yee(
+            center, wave_vector, inv_permittivities, inv_permeabilities, resolution, time_step_duration
+        )
+
+
+def test_calculate_time_offset_yee_different_wave_vectors():
+    """Test calculate_time_offset_yee with different wave vector directions."""
+    center = jnp.array([1.0, 1.0])
+    inv_permittivities = jnp.ones((3, 3, 1))
+    inv_permeabilities = 1.0
+    resolution = 0.1
+    time_step_duration = 1e-15
+
+    # Test with different wave vector magnitudes and directions
+    wave_vectors = [
+        jnp.array([1.0, 0.0, 0.0]),
+        jnp.array([0.0, 1.0, 0.0]),
+        jnp.array([0.707, 0.707, 0.0]),  # 45 degree angle
+        jnp.array([2.0, 0.0, 0.0]),  # Larger magnitude
+    ]
+
+    results = []
+    for wv in wave_vectors:
+        time_offset_E, time_offset_H = calculate_time_offset_yee(
+            center, wv, inv_permittivities, inv_permeabilities, resolution, time_step_duration
+        )
+        results.append((time_offset_E, time_offset_H))
+
+    # All results should be finite
+    for time_offset_E, time_offset_H in results:
+        assert jnp.all(jnp.isfinite(time_offset_E))
+        assert jnp.all(jnp.isfinite(time_offset_H))
+
+    # Results should be different for different wave vectors
+    assert not jnp.allclose(results[0][0], results[1][0])
+    assert not jnp.allclose(results[0][0], results[2][0])
+
+
+def test_calculate_time_offset_yee_varying_refractive_index():
+    """Test that time offsets scale correctly with refractive index."""
+    center = jnp.array([1.0, 1.0])
+    wave_vector = jnp.array([1.0, 0.0, 0.0])
+    resolution = 0.1
+    time_step_duration = 1e-15
+
+    # Test with different refractive indices
+    # n = 1 (air): inv_eps = 1
+    inv_permittivities_n1 = jnp.ones((3, 3, 1))
+    # n = 2: inv_eps = 0.25
+    inv_permittivities_n2 = jnp.ones((3, 3, 1)) * 0.25
+
+    inv_permeabilities = 1.0
+
+    time_offset_E_n1, _ = calculate_time_offset_yee(
+        center, wave_vector, inv_permittivities_n1, inv_permeabilities, resolution, time_step_duration
+    )
+
+    time_offset_E_n2, _ = calculate_time_offset_yee(
+        center, wave_vector, inv_permittivities_n2, inv_permeabilities, resolution, time_step_duration
+    )
+
+    # Higher refractive index should lead to larger time offsets (slower light)
+    # Time offset scales linearly with refractive index
+    # The ratio should be approximately 2.0
+    ratio = jnp.abs(time_offset_E_n2).mean() / jnp.abs(time_offset_E_n1).mean()
+    assert jnp.isclose(ratio, 2.0, rtol=0.01)
