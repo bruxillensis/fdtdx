@@ -1,0 +1,757 @@
+"""
+Adjoint optimization of a silicon / silicon nitride antenna emitter / splitter.
+
+The device couples light from a 300nm-wide input silicon waveguide, splitting it
+between (1) a downward-emitted Gaussian beam into the buried oxide and
+(2) a 300nm-wide output silicon waveguide on the far side of the device.
+
+Stack-up (bottom to top, z-axis) — simulation volume covers oxide only:
+    1. Buried oxide  SiO2       (3 um)
+    2. Silicon device layer      (220 nm)  -- input/output waveguides + 4x4 um optimizable device
+    3. Interlayer oxide SiO2     (150 nm)
+    4. Silicon nitride Si3N4     (400 nm)  -- 4x4 um optimizable device
+    5. Top cladding SiO2         (3 um)
+
+The Si substrate and freespace above are excluded to reduce memory; PMLs absorb
+downward- and upward-propagating light at the boundaries.
+
+The script defines two Device regions (one in the Si layer, one in the SiN layer)
+that are jointly optimized via gradient descent. The figure of merit is the sum of
+(a) coherent Gaussian overlap at a detector plane 0.35 μm above the BOX bottom
+    (downward emission, converging to a focal point below the detector) and
+(b) the fraction of input power coupled into the output waveguide, weighted by the
+    user-specified radiation_fraction split ratio.
+"""
+
+import sys
+import time
+
+import chex
+import jax
+import jax.numpy as jnp
+import optax
+import pytreeclass as tc
+from loguru import logger
+
+import fdtdx
+
+# ---------------------------------------------------------------------------
+# Material constants
+# ---------------------------------------------------------------------------
+PERMITTIVITY_SI = fdtdx.constants.relative_permittivity_silicon  # 12.25 (n~3.5)
+PERMITTIVITY_SIO2 = fdtdx.constants.relative_permittivity_silica  # 2.25  (n~1.5)
+PERMITTIVITY_SIN = 4.0  # Si3N4 at 1550 nm (n~2.0)
+PERMITTIVITY_AIR = fdtdx.constants.relative_permittivity_air  # 1.0
+
+
+def gaussian_overlap(
+    phasor: jax.Array,
+    grid_shape_y: int,
+    grid_shape_x: int,
+    beam_waist_cells: float,
+    x_offset_cells: float,
+    z_focal_cells: float,
+    n_medium: float,
+    wavelength_cells: float,
+    propagation_sign: float = 1.0,
+) -> jax.Array:
+    """Compute coherent overlap of phasor field with a focused Gaussian beam profile.
+
+    The target profile is the cross-section at the detector plane of a Gaussian beam
+    whose waist (focus) is at (x_offset, 0, ±z_focal) relative to the detector. The
+    profile accounts for beam spreading, wavefront curvature, and propagation angle.
+
+    Coordinate convention:
+      - x: centered on detector (emitter center at x=0)
+      - y: starts at 0 (PMC symmetry plane = beam center)
+      - z: detector at z=0; focus is at z = propagation_sign * z_focal
+
+    The beam axis runs from the detector through (x_offset, 0, propagation_sign*z_focal).
+
+      - Transverse distance from axis: ρ² = x²·cos²θ + y²  (θ = arctan(x_offset/z_focal))
+      - Beam radius:  w(d) = w₀·√(1 + (d/z_R)²),  d = √(x_offset²+z_focal²)
+      - Curvature:    R(d) = d·(1 + (z_R/d)²)
+      - Tilt carrier: exp(ik·x·sinθ)
+
+    For downward-propagating beams (focus below detector) pass propagation_sign=-1.0.
+    This flips the sign of the wavefront curvature phase so the mode converges in the
+    correct direction.
+
+    Uses complex inner product |⟨E, G⟩|² / (⟨E,E⟩·⟨G,G⟩).
+
+    Args:
+        phasor: complex array of shape (num_freq, num_components, Nx, Ny, 1).
+        grid_shape_y: number of grid cells in y.
+        grid_shape_x: number of grid cells in x.
+        beam_waist_cells: Gaussian beam waist w₀ at the focal point, in grid cells.
+        x_offset_cells: x-position of the focal point relative to detector center, in grid cells.
+        z_focal_cells: z-distance from detector plane to focal point (always positive), in grid cells.
+        n_medium: refractive index of the medium at the detector (e.g. 1.5 for SiO₂).
+        wavelength_cells: free-space wavelength λ₀ in grid cells (= λ₀ / resolution).
+        propagation_sign: +1.0 for upward emission (focus above detector),
+                          -1.0 for downward emission (focus below detector).
+
+    Returns:
+        Real scalar overlap in [0, 1].
+    """
+    xs = jnp.arange(grid_shape_x) - (grid_shape_x - 1) / 2.0
+    ys = jnp.arange(grid_shape_y)  # y=0 at PMC symmetry plane
+    xx, yy = jnp.meshgrid(xs, ys, indexing="ij")
+
+    # Beam geometry
+    wavelength_med_cells = wavelength_cells / n_medium          # λ in medium
+    z_R = jnp.pi * beam_waist_cells**2 / wavelength_med_cells   # Rayleigh range
+    d = jnp.sqrt(x_offset_cells**2 + z_focal_cells**2)          # axis-distance to focus
+    w_det = beam_waist_cells * jnp.sqrt(1.0 + (d / z_R) ** 2)  # beam radius at detector
+    R_det = d * (1.0 + (z_R / d) ** 2)                          # radius of curvature
+    theta = jnp.arctan2(x_offset_cells, z_focal_cells)          # tilt angle from z-axis
+    k = 2.0 * jnp.pi * n_medium / wavelength_cells              # wavenumber in grid cells
+
+    # Transverse distance from the tilted beam axis at the detector plane
+    rho_sq = xx**2 * jnp.cos(theta) ** 2 + yy**2
+
+    amplitude = jnp.exp(-rho_sq / w_det**2)
+    # Curvature phase flips sign for downward-propagating beam (propagation_sign=-1):
+    #   upward   (+1): exp(-ik·ρ²/2R)  — converges above detector
+    #   downward (-1): exp(+ik·ρ²/2R)  — converges below detector
+    phase = propagation_sign * (-k * rho_sq / (2.0 * R_det)) + k * xx * jnp.sin(theta)
+    gauss = amplitude * jnp.exp(1j * phase)  # complex target field
+
+    # phasor shape: (num_freq, num_components, Nx, Ny, 1)
+    phasor_2d = phasor[0, :, :, :, 0]  # (num_components, Nx, Ny)
+
+    # Coherent overlap per component: ⟨E_i, G⟩ = ∫ E_i · G* dA
+    overlap_per_component = jnp.sum(phasor_2d * jnp.conj(gauss)[None, :, :], axis=(1, 2))
+
+    overlap_power = jnp.sum(jnp.abs(overlap_per_component) ** 2)
+    field_power = jnp.sum(jnp.abs(phasor_2d) ** 2)
+    gauss_power = jnp.sum(jnp.abs(gauss) ** 2)
+
+    return overlap_power / jnp.maximum(field_power * gauss_power, 1e-30)
+
+
+def main(
+    seed: int,
+    evaluation: bool,
+    backward: bool,
+):
+    logger.info(f"{seed=}")
+
+    exp_logger = fdtdx.Logger(
+        experiment_name="antenna_emitter",
+        name=None,
+    )
+    key = jax.random.PRNGKey(seed=seed)
+
+    # ------------------------------------------------------------------
+    # Simulation parameters
+    # ------------------------------------------------------------------
+    wavelength = 1.55e-6
+    period = fdtdx.constants.wavelength_to_period(wavelength)
+    resolution = 25e-9  # 25 nm grid
+
+    config = fdtdx.SimulationConfig(
+        time=200e-15,
+        resolution=resolution,
+        dtype=jnp.float32,
+        courant_factor=0.99,
+    )
+
+    period_steps = round(period / config.time_step_duration)
+    all_time_steps = list(range(config.time_steps_total))
+    logger.info(f"{config.time_steps_total=}")
+    logger.info(f"{period_steps=}")
+    logger.info(f"{config.max_travel_distance=}")
+
+    # Gradient config for adjoint
+    if not evaluation or backward:
+        gradient_config = fdtdx.GradientConfig(
+            recorder=fdtdx.Recorder(
+                modules=[
+                    fdtdx.LinearReconstructEveryK(k=5),
+                    fdtdx.DtypeConversion(dtype=jnp.float8_e4m3fnuz),
+                ]
+            )
+        )
+        config = config.aset("gradient_config", gradient_config)
+
+    placement_constraints, object_list = [], []
+
+    # ------------------------------------------------------------------
+    # Layer thicknesses
+    # ------------------------------------------------------------------
+    t_box = 1.0e-6          # buried oxide (PML below absorbs downward emission)
+    t_si = 220e-9           # silicon device layer
+    t_spacer = 150e-9       # interlayer oxide
+    t_sin = 400e-9          # silicon nitride
+    t_topclad = 750e-9      # top cladding oxide
+    t_det_above_box_bottom = 0.35e-6  # downward detector sits this far above the BOX bottom (above PML)
+
+    t_oxide_total = t_box + t_si + t_spacer + t_sin + t_topclad
+    total_z = t_oxide_total  # no freespace — detectors are inside the oxide
+
+    # Device / emitter dimensions
+    device_length_x = 4.0e-6   # device size along propagation
+    device_width_y = 4.0e-6    # device size in transverse direction
+    waveguide_width = 300e-9   # input/output waveguide width
+    waveguide_margin_x = 3.0e-6  # straight waveguide length on each side of device
+
+    n_si_etch_levels = 3  # number of etch levels in Si device layer
+
+    total_x = device_length_x + 2 * waveguide_margin_x
+    # PMC at min_y exploits TE mirror symmetry → simulate only half the y-domain
+    total_y = device_width_y / 2 + 4.0e-6
+
+    # ------------------------------------------------------------------
+    # Simulation volume
+    # ------------------------------------------------------------------
+    volume = fdtdx.SimulationVolume(
+        partial_real_shape=(total_x, total_y, total_z),
+    )
+    object_list.append(volume)
+
+    # PML boundaries (PEC at min_y for TE symmetry → halves y-domain)
+    # PEC is correct for TE (Ey-dominant): tangential E (Ex, Ez) = 0 at y=0,
+    # while Ey (normal to boundary) is free and maximum at the symmetry plane.
+    bound_cfg = fdtdx.BoundaryConfig.from_uniform_bound(
+        thickness=10,
+        override_types={"min_y": "pec"},
+    )
+    bound_dict, c_list = fdtdx.boundary_objects_from_config(bound_cfg, volume)
+    placement_constraints.extend(c_list)
+    object_list.extend(list(bound_dict.values()))
+
+    # ------------------------------------------------------------------
+    # Materials
+    # ------------------------------------------------------------------
+    mat_si = fdtdx.Material(permittivity=PERMITTIVITY_SI)
+    mat_sio2 = fdtdx.Material(permittivity=PERMITTIVITY_SIO2)
+
+    # ------------------------------------------------------------------
+    # Layer stack (placed bottom-up relative to volume)
+    # Si substrate and freespace above are excluded from the simulation volume
+    # to reduce memory. PML at the bottom absorbs downward-propagating light.
+    # ------------------------------------------------------------------
+    # SiO2 oxide stack fills the full volume except the freespace above.
+    # Si and SiN only exist in the device regions and waveguide.
+    oxide_stack = fdtdx.UniformMaterialObject(
+        name="Oxide_stack",
+        partial_real_shape=(None, None, t_oxide_total),
+        material=mat_sio2,
+        color=fdtdx.colors.XKCD_ORANGE,
+    )
+    placement_constraints.append(
+        oxide_stack.place_relative_to(volume, axes=2, own_positions=-1, other_positions=-1)
+    )
+    object_list.append(oxide_stack)
+
+
+    # ------------------------------------------------------------------
+    # Optimizable devices
+    # ------------------------------------------------------------------
+    voxel_size = resolution  # match resolution
+
+    # Device in Si layer: patterns Si vs SiO2
+    # 3 etch levels in z — PillarDiscretization enforces that lower layers
+    # must be Si for upper layers to be Si (top-down etch constraint).
+    # StandardToInversePermittivityRange maps [0,1] params into inv-perm
+    # space so PillarDiscretization's distance metric is physically correct.
+    si_device_materials = {
+        "SiO2": mat_sio2,
+        "Silicon": mat_si,
+    }
+    si_device = fdtdx.Device(
+        name="Si_Device",
+        partial_real_shape=(device_length_x, device_width_y / 2, t_si),  # 4 x 2 um (half-y)
+        materials=si_device_materials,
+        param_transforms=[
+            fdtdx.TanhProjection(),
+            fdtdx.StandardToInversePermittivityRange(),
+            fdtdx.PillarDiscretization(axis=2, single_polymer_columns=True),
+            fdtdx.GaussianSmoothing2D(std_discrete=3),
+        ],
+        partial_voxel_real_shape=(voxel_size, voxel_size, None),
+        partial_voxel_grid_shape=(None, None, n_si_etch_levels),
+    )
+    # Si device sits at BOX top: oxide_stack bottom + t_box
+    # y-edge at PMC boundary (min_y), centered in x
+    placement_constraints.extend([
+        si_device.place_relative_to(
+            oxide_stack, axes=2, own_positions=-1, other_positions=-1,
+            margins=t_box,
+        ),
+        si_device.place_at_center(volume, axes=0),
+        si_device.place_relative_to(volume, axes=1, own_positions=-1, other_positions=-1),
+    ])
+    object_list.append(si_device)
+
+    # Device in SiN layer: patterns SiN vs SiO2
+    sin_device_materials = {
+        "SiO2": mat_sio2,
+        "SiN": fdtdx.Material(permittivity=PERMITTIVITY_SIN),
+    }
+    sin_device = fdtdx.Device(
+        name="SiN_Device",
+        partial_real_shape=(device_length_x, device_width_y / 2, t_sin),
+        materials=sin_device_materials,
+        param_transforms=[
+            fdtdx.GaussianSmoothing2D(std_discrete=3),
+            fdtdx.SubpixelSmoothedProjection(),
+        ],
+        partial_voxel_real_shape=(voxel_size, voxel_size, t_sin),
+    )
+    # SiN device sits at: oxide_stack bottom + t_box + t_si + t_spacer
+    # y-edge at PMC boundary (min_y), centered in x
+    placement_constraints.extend([
+        sin_device.place_relative_to(
+            oxide_stack, axes=2, own_positions=-1, other_positions=-1,
+            margins=t_box + t_si + t_spacer,
+        ),
+        sin_device.place_at_center(volume, axes=0),
+        sin_device.place_relative_to(volume, axes=1, own_positions=-1, other_positions=-1),
+    ])
+    object_list.append(sin_device)
+
+    # ------------------------------------------------------------------
+    # Input waveguide (300 nm wide Si, waveguide_margin_x long, left of device)
+    # ------------------------------------------------------------------
+    waveguide_in = fdtdx.UniformMaterialObject(
+        name="Waveguide_in",
+        partial_real_shape=(waveguide_margin_x, waveguide_width / 2, t_si),
+        material=mat_si,
+        color=fdtdx.colors.XKCD_LIGHT_BLUE,
+    )
+    placement_constraints.extend([
+        waveguide_in.place_relative_to(volume, axes=1, own_positions=-1, other_positions=-1),
+        waveguide_in.place_relative_to(si_device, axes=0, own_positions=1, other_positions=-1),
+        waveguide_in.place_relative_to(
+            oxide_stack, axes=2, own_positions=-1, other_positions=-1,
+            margins=t_box,
+        ),
+    ])
+    object_list.append(waveguide_in)
+
+    # ------------------------------------------------------------------
+    # Output waveguide (300 nm wide Si, waveguide_margin_x long, right of device)
+    # ------------------------------------------------------------------
+    waveguide_out = fdtdx.UniformMaterialObject(
+        name="Waveguide_out",
+        partial_real_shape=(waveguide_margin_x, waveguide_width / 2, t_si),
+        material=mat_si,
+        color=fdtdx.colors.XKCD_LIGHT_BLUE,
+    )
+    placement_constraints.extend([
+        waveguide_out.place_relative_to(volume, axes=1, own_positions=-1, other_positions=-1),
+        waveguide_out.place_relative_to(si_device, axes=0, own_positions=-1, other_positions=1),
+        waveguide_out.place_relative_to(
+            oxide_stack, axes=2, own_positions=-1, other_positions=-1,
+            margins=t_box,
+        ),
+    ])
+    object_list.append(waveguide_out)
+
+    # ------------------------------------------------------------------
+    # Mode source (TE fundamental in Si waveguide, propagating +x)
+    # Z-extent limited to oxide stack region to exclude Si substrate from
+    # mode computation (otherwise the solver finds the substrate slab mode).
+    # ------------------------------------------------------------------
+    source = fdtdx.ModePlaneSource(
+        partial_grid_shape=(1, None, None),
+        partial_real_shape=(None, None, t_oxide_total),
+        wave_character=fdtdx.WaveCharacter(wavelength=wavelength),
+        direction="+",
+        mode_index=0,
+        filter_pol="te",
+    )
+    placement_constraints.extend([
+        source.place_relative_to(
+            volume,
+            axes=0,
+            own_positions=-1,
+            other_positions=-1,
+            grid_margins=bound_cfg.thickness_grid_minx + 4,
+        ),
+        source.place_relative_to(
+            oxide_stack,
+            axes=2,
+            own_positions=-1,
+            other_positions=-1,
+        ),
+    ])
+    object_list.append(source)
+
+    # ------------------------------------------------------------------
+    # Detectors
+    # ------------------------------------------------------------------
+    # Input flux (for normalization)
+    flux_in_detector = fdtdx.PoyntingFluxDetector(
+        name="in_flux",
+        partial_grid_shape=(1, None, None),
+        direction="+",
+        switch=fdtdx.OnOffSwitch(
+            fixed_on_time_steps=all_time_steps[7 * period_steps : 8 * period_steps]
+        ),
+    )
+    placement_constraints.append(
+        flux_in_detector.place_relative_to(
+            volume, axes=0, own_positions=-1, other_positions=-1,
+            grid_margins=bound_cfg.thickness_grid_minx + 6,
+        )
+    )
+    object_list.append(flux_in_detector)
+
+    # Downward flux in the BOX (-z direction)
+    flux_down_detector = fdtdx.PoyntingFluxDetector(
+        name="down_flux",
+        partial_grid_shape=(None, None, 1),
+        direction="-",
+        fixed_propagation_axis=2,
+        switch=fdtdx.OnOffSwitch(
+            fixed_on_time_steps=all_time_steps[-2 * period_steps :]
+        ),
+    )
+    placement_constraints.append(
+        flux_down_detector.place_relative_to(
+            oxide_stack, axes=2, own_positions=-1, other_positions=-1,
+            margins=t_det_above_box_bottom,
+        )
+    )
+    object_list.append(flux_down_detector)
+
+    # Output waveguide flux (for coupling efficiency)
+    flux_out_detector = fdtdx.PoyntingFluxDetector(
+        name="out_flux",
+        partial_grid_shape=(1, None, None),
+        direction="+",
+        switch=fdtdx.OnOffSwitch(
+            fixed_on_time_steps=all_time_steps[7 * period_steps : 8 * period_steps]
+        ),
+    )
+    placement_constraints.append(
+        flux_out_detector.place_relative_to(
+            volume, axes=0, own_positions=1, other_positions=1,
+            grid_margins=-(bound_cfg.thickness_grid_maxx + 6),
+        )
+    )
+    object_list.append(flux_out_detector)
+
+    # Phasor detector for Gaussian overlap (same plane as downward flux)
+    phasor_detector = fdtdx.PhasorDetector(
+        name="phasor_down",
+        partial_grid_shape=(None, None, 1),
+        wave_characters=(fdtdx.WaveCharacter(wavelength=wavelength),),
+        components=("Ex", "Ey"),
+        switch=fdtdx.OnOffSwitch(
+            period=period,
+            start_time=0.75 * config.time,
+            on_for_periods=3,
+        ),
+    )
+    placement_constraints.append(
+        phasor_detector.place_relative_to(
+            oxide_stack, axes=2, own_positions=-1, other_positions=-1,
+            margins=t_det_above_box_bottom,
+        )
+    )
+    object_list.append(phasor_detector)
+
+    # Energy detector (last step, for diagnostics)
+    energy_last_step = fdtdx.EnergyDetector(
+        name="energy_last_step",
+        as_slices=True,
+        switch=fdtdx.OnOffSwitch(fixed_on_time_steps=[-1]),
+    )
+    placement_constraints.extend([*energy_last_step.same_position_and_size(volume)])
+    object_list.append(energy_last_step)
+
+    exclude_object_list: list[fdtdx.SimulationObject] = [energy_last_step]
+
+    if evaluation:
+        video_detector = fdtdx.EnergyDetector(
+            name="video",
+            as_slices=True,
+            switch=fdtdx.OnOffSwitch(interval=10),
+            exact_interpolation=True,
+            num_video_workers=10,
+        )
+        placement_constraints.extend([*video_detector.same_position_and_size(volume)])
+        exclude_object_list.append(video_detector)
+        object_list.append(video_detector)
+        if backward:
+            backward_video_detector = fdtdx.EnergyDetector(
+                name="backward_video",
+                as_slices=True,
+                inverse=True,
+                switch=fdtdx.OnOffSwitch(interval=10),
+                exact_interpolation=True,
+                num_video_workers=10,
+            )
+            placement_constraints.extend(
+                [*backward_video_detector.same_position_and_size(volume)]
+            )
+            exclude_object_list.append(backward_video_detector)
+            object_list.append(backward_video_detector)
+
+    # ------------------------------------------------------------------
+    # Place all objects
+    # ------------------------------------------------------------------
+    key, subkey = jax.random.split(key)
+    objects, arrays, params, config, _ = fdtdx.place_objects(
+        object_list=object_list,
+        config=config,
+        constraints=placement_constraints,
+        key=subkey,
+    )
+
+    start_idx = 0
+
+    logger.info(tc.tree_summary(arrays, depth=2))
+    print(tc.tree_diagram(config, depth=4))
+
+    # ------------------------------------------------------------------
+    # Optimizer
+    # ------------------------------------------------------------------
+    epochs = 501
+    if not evaluation:
+        schedule: optax.Schedule = optax.warmup_cosine_decay_schedule(
+            init_value=1e-5,
+            peak_value=0.003,
+            end_value=0.0003,
+            warmup_steps=15,
+            decay_steps=round(0.9 * epochs),
+        )
+        optimizer = optax.inject_hyperparams(optax.nadam)(learning_rate=schedule)
+        optimizer = optax.MultiSteps(optimizer, every_k_schedule=1)
+        opt_state: optax.OptState = optimizer.init(params)
+
+    # Beta schedule for binarization
+    def custom_schedule(idx: chex.Numeric) -> chex.Numeric:
+        beta_schedule = optax.linear_schedule(0.1, 50, epochs)
+        return jax.lax.cond(
+            idx < epochs - 2,
+            lambda: beta_schedule(idx),
+            lambda: jnp.inf,
+        )
+
+    # ------------------------------------------------------------------
+    # Save setup
+    # ------------------------------------------------------------------
+    exp_logger.savefig(
+        exp_logger.cwd,
+        "setup.png",
+        fdtdx.plot_setup(
+            config=config,
+            objects=objects,
+            exclude_object_list=exclude_object_list,
+        ),
+    )
+
+    changed_voxels = exp_logger.log_params(
+        iter_idx=-1,
+        params=params,
+        objects=objects,
+        export_stl=True,
+        export_figure=True,
+        beta=custom_schedule(start_idx),
+    )
+
+    _, tmp, _ = fdtdx.apply_params(arrays, objects, params, key, beta=custom_schedule(start_idx))
+    tmp.sources[0].plot(exp_logger.cwd / "figures" / "mode.png")  # type: ignore
+
+    # ------------------------------------------------------------------
+    # Split ratio target
+    # ------------------------------------------------------------------
+    # Fraction of input power to direct upward (Gaussian emission).
+    # Remainder (1 - radiation_fraction) targets the output waveguide.
+    # Examples: 0.5 = 50/50,  0.3 = 30% up / 70% waveguide
+    radiation_fraction = 0.5
+
+    # Gaussian target parameters for overlap computation.
+    # Specify the desired focal point below the detector in physical units.
+    # The overlap function evaluates the correct Gaussian beam cross-section
+    # at the detector plane (beam spreading + curved wavefront + tilt carrier).
+    # propagation_sign=-1 is passed to gaussian_overlap to indicate downward emission.
+    focal_beam_waist_um = 0.465    # w₀ at focus (um) — sets the tightness of focus
+    focal_x_offset_um = 0.0        # x-position of focus relative to device center (um)
+    focal_z_distance_um = 2.0      # z-distance from detector plane to focus, below detector (um)
+
+    n_sio2 = float(jnp.sqrt(PERMITTIVITY_SIO2))
+    beam_waist_cells = focal_beam_waist_um * 1e-6 / resolution
+    x_offset_cells = focal_x_offset_um * 1e-6 / resolution
+    z_focal_cells = focal_z_distance_um * 1e-6 / resolution
+    wavelength_cells = wavelength / resolution
+
+    # ------------------------------------------------------------------
+    # Loss function
+    # ------------------------------------------------------------------
+    def loss_func(
+        params: fdtdx.ParameterContainer,
+        arrays: fdtdx.ArrayContainer,
+        key: jax.Array,
+        idx: int,
+    ):
+        arrays, new_objects, info = fdtdx.apply_params(
+            arrays, objects, params, key, beta=custom_schedule(idx)
+        )
+
+        final_state = fdtdx.run_fdtd(
+            arrays=arrays,
+            objects=new_objects,
+            config=config,
+            key=key,
+        )
+
+        _, arrays = final_state
+
+        # --- Flux bookkeeping ---
+        total_in_flux = arrays.detector_states[flux_in_detector.name]["poynting_flux"].sum()
+        total_down_flux = arrays.detector_states[flux_down_detector.name]["poynting_flux"].sum()
+        total_out_flux = arrays.detector_states[flux_out_detector.name]["poynting_flux"].sum()
+        flux_efficiency_down = total_down_flux / jnp.maximum(total_in_flux, 1e-30)
+        flux_efficiency_out = total_out_flux / jnp.maximum(total_in_flux, 1e-30)
+
+        # --- Gaussian overlap (mode quality of downward emission) ---
+        phasor_data = arrays.detector_states[phasor_detector.name]["phasor"]
+        # phasor shape: (1, num_freq, num_components, Nx, Ny, 1)
+        # The leading dim is the latent time step dim
+        phasor_field = phasor_data[0]  # (num_freq, num_components, Nx, Ny, 1)
+        phasor_grid_x = phasor_field.shape[2]
+        phasor_grid_y = phasor_field.shape[3]
+        overlap = gaussian_overlap(
+            phasor_field,
+            phasor_grid_y,
+            phasor_grid_x,
+            beam_waist_cells=beam_waist_cells,
+            x_offset_cells=x_offset_cells,
+            z_focal_cells=z_focal_cells,
+            n_medium=n_sio2,
+            wavelength_cells=wavelength_cells,
+            propagation_sign=-1.0,  # downward emission: focus is below the detector
+        )
+
+        # Ratio-targeting objective using a bottleneck metric.
+        # Normalize each efficiency to its target fraction, then take the minimum.
+        # The result peaks at 1.0 only when both terms simultaneously meet their
+        # targets — any deviation from the intended split is penalized naturally.
+        # Multiplying by the Gaussian overlap ties mode quality into the objective.
+        norm_down = flux_efficiency_down / radiation_fraction
+        norm_out = flux_efficiency_out / (1.0 - radiation_fraction)
+        objective = jnp.minimum(norm_down, norm_out) * overlap
+
+        if evaluation and backward:
+            _, arrays = fdtdx.full_backward(
+                state=final_state,
+                objects=new_objects,
+                config=config,
+                key=key,
+                record_detectors=True,
+                reset_fields=True,
+            )
+
+        new_info = {
+            "total_in_flux": total_in_flux,
+            "total_down_flux": total_down_flux,
+            "total_out_flux": total_out_flux,
+            "flux_efficiency_down": flux_efficiency_down,
+            "flux_efficiency_out": flux_efficiency_out,
+            "gaussian_overlap": overlap,
+            "objective": objective,
+            **info,
+        }
+        return -objective, (arrays, new_info)
+
+    # ------------------------------------------------------------------
+    # JIT compilation
+    # ------------------------------------------------------------------
+    compile_start_time = time.time()
+    print("Started Compilation...")
+    jit_task_id = exp_logger.progress.add_task("JIT", total=None)
+    idx_dummy_arr = jnp.asarray(start_idx, dtype=jnp.float32)
+    if evaluation:
+        jitted_loss = (
+            jax.jit(loss_func, donate_argnames=["arrays"])
+            .lower(params, arrays, key, idx_dummy_arr)
+            .compile()
+        )
+    else:
+        jitted_loss = (
+            jax.jit(jax.value_and_grad(loss_func, has_aux=True), donate_argnames=["arrays"])
+            .lower(params, arrays, key, idx_dummy_arr)
+            .compile()
+        )
+    compile_delta_time = time.time() - compile_start_time
+    exp_logger.progress.update(jit_task_id, total=1, completed=1, refresh=True)
+    print(f"Finished Compilation in {compile_delta_time:.1f} seconds")
+
+    # ------------------------------------------------------------------
+    # Optimization loop
+    # ------------------------------------------------------------------
+    optim_task_id = exp_logger.progress.add_task(
+        "Optimization", total=1 if evaluation else epochs
+    )
+    for epoch in range(start_idx, start_idx + 1 if evaluation else epochs):
+        run_start_time = time.time()
+        key, subkey = jax.random.split(key)
+        idx_arr = jnp.asarray(epoch, dtype=jnp.float32)
+
+        if evaluation:
+            loss, (arrays, info) = jitted_loss(params, arrays, subkey, idx_arr)
+        else:
+            (loss, (arrays, info)), grads = jitted_loss(params, arrays, subkey, idx_arr)
+
+            updates, opt_state = optimizer.update(grads, opt_state, params)  # type: ignore
+            info["lr"] = opt_state.inner_opt_state.hyperparams["learning_rate"]
+            params = optax.apply_updates(params, updates)
+            params = jax.tree_util.tree_map(lambda p: jnp.clip(p, 0, 1), params)
+            info["grad_norm"] = optax.global_norm(grads)
+            info["update_norm"] = optax.global_norm(updates)
+
+        runtime_delta = time.time() - run_start_time
+        info["runtime"] = runtime_delta
+        info["loss"] = loss
+
+        if evaluation:
+            logger.info(f"{compile_delta_time=}")
+            logger.info(f"{runtime_delta=}")
+
+        changed_voxels = exp_logger.log_params(
+            iter_idx=epoch,
+            params=params,
+            objects=objects,
+            export_stl=True,
+            export_figure=True,
+            beta=custom_schedule(epoch),
+        )
+        info["changed_voxels"] = changed_voxels
+
+        exp_logger.log_detectors(
+            iter_idx=epoch, objects=objects, detector_states=arrays.detector_states
+        )
+
+        exp_logger.write(info)
+        exp_logger.progress.update(optim_task_id, advance=1)
+
+        if epoch % 25 == 0:
+            logger.info(
+                f"Epoch {epoch}: loss={float(loss):.4f} "
+                f"flux_down={float(info['flux_efficiency_down']):.4f} "
+                f"flux_out={float(info['flux_efficiency_out']):.4f} "
+                f"gauss_overlap={float(info['gaussian_overlap']):.4f}"
+            )
+
+
+if __name__ == "__main__":
+    seed = 0
+    evaluation = False
+    backward = False
+    if len(sys.argv) > 1:
+        seed = int(sys.argv[1])
+    if len(sys.argv) > 2:
+        evaluation = sys.argv[2].lower() in ("true", "1", "eval")
+    if len(sys.argv) > 3:
+        backward = sys.argv[3].lower() in ("true", "1")
+    main(
+        seed=seed,
+        evaluation=evaluation,
+        backward=backward,
+    )

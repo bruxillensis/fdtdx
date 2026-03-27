@@ -181,10 +181,16 @@ class GaussianSmoothing2D(SameShapeTypeParameterTransform):
     #: Integer specifying the standard deviation of the Gaussian kernel in discrete units.
     std_discrete: int = frozen_field()
 
-    _fixed_input_type: ParameterType | Sequence[ParameterType] | None = frozen_private_field(
-        default=ParameterType.CONTINUOUS
-    )
-    _all_arrays_2d: bool = frozen_private_field(default=True)
+    _fixed_input_type: ParameterType | Sequence[ParameterType] | None = frozen_private_field(default=None)
+    _all_arrays_2d: bool = frozen_private_field(default=False)
+
+    def _get_output_type_impl(
+        self,
+        input_type: dict[str, ParameterType],
+    ) -> dict[str, ParameterType]:
+        # Smoothing always produces continuous values regardless of input type
+        # (smoothing a binary field yields floats in [0, 1]).
+        return {k: ParameterType.CONTINUOUS for k in input_type}
 
     def __call__(
         self,
@@ -195,29 +201,25 @@ class GaussianSmoothing2D(SameShapeTypeParameterTransform):
         return {k: self._apply_smoothing(v) for k, v in params.items()}
 
     def _apply_smoothing(self, x: jax.Array) -> jax.Array:
-        vertical_axis = x.shape.index(1)
-        x_squeezed = x.squeeze(vertical_axis)
-        # Check if the array is 2D
-        if x_squeezed.ndim != 2:
-            raise ValueError(f"Expected 2D array, got shape {x_squeezed.shape}")
-
-        # Create Gaussian kernel
         kernel_size = 6 * self.std_discrete + 1  # Ensure kernel covers 3 std on each side
         kernel = self._create_gaussian_kernel(kernel_size, self.std_discrete)
 
-        # pad array with edge values
+        if 1 in x.shape:
+            # 2D mode: squeeze the size-1 axis, smooth, restore shape
+            vertical_axis = x.shape.index(1)
+            x_squeezed = x.squeeze(vertical_axis)
+            result = self._smooth_slice(x_squeezed, kernel, kernel_size)
+            return result.reshape(x.shape)
+        else:
+            # 3D mode: apply 2D smoothing independently to each slice along the last axis
+            slices = [self._smooth_slice(x[..., i], kernel, kernel_size) for i in range(x.shape[2])]
+            return jnp.stack(slices, axis=-1)
+
+    def _smooth_slice(self, x_2d: jax.Array, kernel: jax.Array, kernel_size: int) -> jax.Array:
         padding_cfg = PaddingConfig(widths=(kernel_size // 2,), modes=("edge",))
-        padded_arr, orig_slice = advanced_padding(x_squeezed, padding_cfg)
-
-        result = jax.scipy.signal.convolve(
-            padded_arr,
-            kernel,
-            mode="same",
-        )
-        result = result[*orig_slice]
-
-        # Reshape back to original dimensions
-        return result.reshape(x.shape)
+        padded_arr, orig_slice = advanced_padding(x_2d, padding_cfg)
+        result = jax.scipy.signal.convolve(padded_arr, kernel, mode="same")
+        return result[*orig_slice]
 
     def _create_gaussian_kernel(self, size: int, sigma: float) -> jax.Array:
         # Create a coordinate grid

@@ -4,7 +4,6 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from matplotlib.patches import Patch
 
 from fdtdx.core.misc import get_background_material_name
 from fdtdx.materials import Material, compute_ordered_names
@@ -57,80 +56,26 @@ def device_matrix_index_figure(
     assert isinstance(fig, Figure)
     assert isinstance(ax, Axes)
     image_palette = sns.color_palette("YlOrBr", as_cmap=True)
-    background_name = get_background_material_name(material)
     ordered_name_list = compute_ordered_names(material)
-    background_index = ordered_name_list.index(background_name)
+    background_name = get_background_material_name(material)
+    foreground_names = [n for n in ordered_name_list if n != background_name]
 
-    if parameter_type == ParameterType.CONTINUOUS:
-        matrix_inverse_permittivity_indices_sorted = device_matrix_indices.mean(axis=-1)
-        indices = np.arange(len(ordered_name_list))
-    elif device_matrix_indices.shape[-1] == 1:
-        device_matrix_indices = device_matrix_indices.astype(np.int32)
-        device_matrix_indices = device_matrix_indices[..., 0]
-        matrix_inverse_permittivity_indices_sorted = device_matrix_indices
-        indices = np.unique(device_matrix_indices)
-    else:
-        device_matrix_indices = device_matrix_indices.astype(np.int32)
-        device_matrix_indices_flat = np.reshape(device_matrix_indices, (-1, device_matrix_indices.shape[-1]))
-        indices = np.unique(
-            device_matrix_indices_flat,
-            axis=0,
-        )
-        background_count = np.count_nonzero(indices == background_index, axis=-1)
-        background_count_argsort = np.argsort(background_count)
-        indices_sorted = indices[background_count_argsort]
-        matrix_inverse_permittivity_indices_sorted = np.array(
-            [
-                np.where((indices_sorted == device_matrix_indices_flat[i]).all(axis=1))[0][0]
-                for i in range(device_matrix_indices_flat.shape[0])
-            ]
-        ).reshape(device_matrix_indices.shape[:-1])
+    # Compute per-cell fill fraction in [0, 1]: 0 = all background, 1 = all foreground.
+    # For continuous output the indices already interpolate between 0 and 1.
+    # For discrete/binary output, mean(axis=-1) gives the fraction of foreground layers.
+    values = np.array(device_matrix_indices, dtype=np.float32).mean(axis=-1)
 
     cax = ax.imshow(
-        matrix_inverse_permittivity_indices_sorted.T,
+        values.T,
         cmap=image_palette,
+        vmin=0.0,
+        vmax=1.0,
         aspect="auto",
         origin="lower",
     )
     ax.set_xlabel("X Axis")
     ax.set_ylabel("Y Axis")
-    height, width = (
-        device_matrix_indices.shape[0],
-        device_matrix_indices.shape[1],
-    )
-    if height * width < 1500:
-        for y in range(height):
-            for x in range(width):
-                value = matrix_inverse_permittivity_indices_sorted[x, y]
-                text_color = "w" if cax.norm(value) > 0.5 else "k"  # type: ignore
-                ax.text(x, y, str(int(value)), ha="center", va="center", color=text_color)
-    assert cax.cmap is not None
-    if indices.ndim == 1:
-        legend_elements = [
-            Patch(
-                facecolor=cax.cmap(cax.norm(int(i))),
-                label=f"({i}) {ordered_name_list[int(i)]}",
-            )
-            for i in indices
-        ]
-    else:
-        legend_elements = [
-            Patch(
-                facecolor=cax.cmap(cax.norm(int(i))),
-                label=f"({i}) " + "|".join([ordered_name_list[int(e)] for e in indices[i]]),
-            )
-            for i in np.unique(matrix_inverse_permittivity_indices_sorted)
-        ]
-
-    legend_cols = max(1, int(len(legend_elements) / height))
-    if len(legend_elements) < 100:
-        ax.legend(
-            handles=legend_elements,
-            loc="center left",
-            frameon=False,
-            bbox_to_anchor=(1, 0.5),
-            ncols=legend_cols,
-        )
+    fig.colorbar(cax, ax=ax, label=f"fill fraction  (0={background_name}, 1={'/'.join(foreground_names)})")
     ax.set_aspect("equal")
     for line in ax.get_xgridlines() + ax.get_ygridlines():
         line.set_alpha(0.0)
