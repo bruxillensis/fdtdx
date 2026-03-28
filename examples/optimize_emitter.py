@@ -383,22 +383,31 @@ def main(
     # ------------------------------------------------------------------
     # Detectors
     # ------------------------------------------------------------------
-    # Input flux (for normalization)
-    flux_in_detector = fdtdx.PoyntingFluxDetector(
-        name="in_flux",
+    # Input mode overlap (for normalization — forward TE₀ power at source plane)
+    mode_in_detector = fdtdx.ModeOverlapDetector(
+        name="mode_in",
         partial_grid_shape=(1, None, None),
+        partial_real_shape=(None, None, t_oxide_total),
+        wave_characters=(fdtdx.WaveCharacter(wavelength=wavelength),),
         direction="+",
+        mode_index=0,
+        filter_pol="te",
         switch=fdtdx.OnOffSwitch(
-            fixed_on_time_steps=all_time_steps[7 * period_steps : 8 * period_steps]
+            period=period,
+            start_time=0.75 * config.time,
+            on_for_periods=3,
         ),
     )
-    placement_constraints.append(
-        flux_in_detector.place_relative_to(
+    placement_constraints.extend([
+        mode_in_detector.place_relative_to(
             volume, axes=0, own_positions=-1, other_positions=-1,
             grid_margins=bound_cfg.thickness_grid_minx + 6,
-        )
-    )
-    object_list.append(flux_in_detector)
+        ),
+        mode_in_detector.place_relative_to(
+            oxide_stack, axes=2, own_positions=-1, other_positions=-1,
+        ),
+    ])
+    object_list.append(mode_in_detector)
 
     # Downward flux in the BOX (-z direction)
     flux_down_detector = fdtdx.PoyntingFluxDetector(
@@ -418,22 +427,31 @@ def main(
     )
     object_list.append(flux_down_detector)
 
-    # Output waveguide flux (for coupling efficiency)
-    flux_out_detector = fdtdx.PoyntingFluxDetector(
-        name="out_flux",
+    # Output mode overlap (forward TE₀ power at output waveguide)
+    mode_out_detector = fdtdx.ModeOverlapDetector(
+        name="mode_out",
         partial_grid_shape=(1, None, None),
+        partial_real_shape=(None, None, t_oxide_total),
+        wave_characters=(fdtdx.WaveCharacter(wavelength=wavelength),),
         direction="+",
+        mode_index=0,
+        filter_pol="te",
         switch=fdtdx.OnOffSwitch(
-            fixed_on_time_steps=all_time_steps[7 * period_steps : 8 * period_steps]
+            period=period,
+            start_time=0.75 * config.time,
+            on_for_periods=3,
         ),
     )
-    placement_constraints.append(
-        flux_out_detector.place_relative_to(
+    placement_constraints.extend([
+        mode_out_detector.place_relative_to(
             volume, axes=0, own_positions=1, other_positions=1,
             grid_margins=-(bound_cfg.thickness_grid_maxx + 6),
-        )
-    )
-    object_list.append(flux_out_detector)
+        ),
+        mode_out_detector.place_relative_to(
+            oxide_stack, axes=2, own_positions=-1, other_positions=-1,
+        ),
+    ])
+    object_list.append(mode_out_detector)
 
     # Phasor detector for Gaussian overlap (same plane as downward flux)
     phasor_detector = fdtdx.PhasorDetector(
@@ -567,18 +585,25 @@ def main(
     radiation_fraction = 0.5
 
     # Gaussian target parameters for overlap computation.
-    # Specify the desired focal point below the detector in physical units.
+    # The focal point is 10 μm below the center of the silicon device layer.
     # The overlap function evaluates the correct Gaussian beam cross-section
     # at the detector plane (beam spreading + curved wavefront + tilt carrier).
     # propagation_sign=-1 is passed to gaussian_overlap to indicate downward emission.
-    focal_beam_waist_um = 0.465    # w₀ at focus (um) — sets the tightness of focus
-    focal_x_offset_um = 0.0        # x-position of focus relative to device center (um)
-    focal_z_distance_um = 2.0      # z-distance from detector plane to focus, below detector (um)
-
     n_sio2 = float(jnp.sqrt(PERMITTIVITY_SIO2))
-    beam_waist_cells = focal_beam_waist_um * 1e-6 / resolution
-    x_offset_cells = focal_x_offset_um * 1e-6 / resolution
-    z_focal_cells = focal_z_distance_um * 1e-6 / resolution
+
+    focal_distance_from_si = 10.0e-6  # focal distance measured from Si layer center
+    si_center_height = t_box + t_si / 2  # Si center above oxide_stack bottom
+    det_height = t_det_above_box_bottom   # detector plane above oxide_stack bottom
+    focal_z_distance = focal_distance_from_si - (si_center_height - det_height)
+
+    # Diffraction-limited beam waist: w₀ = √(λ₀ · f / (π · n))
+    # This is the tightest Gaussian focus at distance f (Rayleigh range = f).
+    focal_beam_waist = float(jnp.sqrt(wavelength * focal_distance_from_si / (jnp.pi * n_sio2)))
+    focal_x_offset = 0.0  # beam centered on device
+
+    beam_waist_cells = focal_beam_waist / resolution
+    x_offset_cells = focal_x_offset / resolution
+    z_focal_cells = focal_z_distance / resolution
     wavelength_cells = wavelength / resolution
 
     # ------------------------------------------------------------------
@@ -603,12 +628,22 @@ def main(
 
         _, arrays = final_state
 
-        # --- Flux bookkeeping ---
-        total_in_flux = arrays.detector_states[flux_in_detector.name]["poynting_flux"].sum()
+        # --- Mode overlap power (input / output waveguide) ---
+        alpha_in = new_objects[mode_in_detector.name].compute_overlap(
+            arrays.detector_states[mode_in_detector.name]
+        )
+        alpha_out = new_objects[mode_out_detector.name].compute_overlap(
+            arrays.detector_states[mode_out_detector.name]
+        )
+        power_in = jnp.abs(alpha_in) ** 2
+        power_out = jnp.abs(alpha_out) ** 2
+
+        # --- Downward flux ---
         total_down_flux = arrays.detector_states[flux_down_detector.name]["poynting_flux"].sum()
-        total_out_flux = arrays.detector_states[flux_out_detector.name]["poynting_flux"].sum()
-        flux_efficiency_down = total_down_flux / jnp.maximum(total_in_flux, 1e-30)
-        flux_efficiency_out = total_out_flux / jnp.maximum(total_in_flux, 1e-30)
+
+        # --- Efficiencies ---
+        flux_efficiency_down = total_down_flux / jnp.maximum(power_in, 1e-30)
+        flux_efficiency_out = power_out / jnp.maximum(power_in, 1e-30)
 
         # --- Gaussian overlap (mode quality of downward emission) ---
         phasor_data = arrays.detector_states[phasor_detector.name]["phasor"]
@@ -649,9 +684,9 @@ def main(
             )
 
         new_info = {
-            "total_in_flux": total_in_flux,
+            "power_in": power_in,
             "total_down_flux": total_down_flux,
-            "total_out_flux": total_out_flux,
+            "power_out": power_out,
             "flux_efficiency_down": flux_efficiency_down,
             "flux_efficiency_out": flux_efficiency_out,
             "gaussian_overlap": overlap,
