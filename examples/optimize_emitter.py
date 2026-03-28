@@ -409,6 +409,23 @@ def main(
     ])
     object_list.append(mode_in_detector)
 
+    # Input Poynting flux (for normalizing downward emission — same time window)
+    flux_in_detector = fdtdx.PoyntingFluxDetector(
+        name="in_flux",
+        partial_grid_shape=(1, None, None),
+        direction="+",
+        switch=fdtdx.OnOffSwitch(
+            fixed_on_time_steps=all_time_steps[-2 * period_steps :]
+        ),
+    )
+    placement_constraints.append(
+        flux_in_detector.place_relative_to(
+            volume, axes=0, own_positions=-1, other_positions=-1,
+            grid_margins=bound_cfg.thickness_grid_minx + 6,
+        )
+    )
+    object_list.append(flux_in_detector)
+
     # Downward flux in the BOX (-z direction)
     flux_down_detector = fdtdx.PoyntingFluxDetector(
         name="down_flux",
@@ -599,7 +616,7 @@ def main(
     # Diffraction-limited beam waist: w₀ = √(λ₀ · f / (π · n))
     # This is the tightest Gaussian focus at distance f (Rayleigh range = f).
     focal_beam_waist = float(jnp.sqrt(wavelength * focal_distance_from_si / (jnp.pi * n_sio2)))
-    focal_x_offset = 0.0  # beam centered on device
+    focal_x_offset = 10.0/2 - 0.775/2  # beam centered on device
 
     beam_waist_cells = focal_beam_waist / resolution
     x_offset_cells = focal_x_offset / resolution
@@ -638,11 +655,14 @@ def main(
         power_in = jnp.abs(alpha_in) ** 2
         power_out = jnp.abs(alpha_out) ** 2
 
-        # --- Downward flux ---
+        # --- Downward flux (both Poynting-based, same time window) ---
+        total_in_flux = arrays.detector_states[flux_in_detector.name]["poynting_flux"].sum()
         total_down_flux = arrays.detector_states[flux_down_detector.name]["poynting_flux"].sum()
 
         # --- Efficiencies ---
-        flux_efficiency_down = total_down_flux / jnp.maximum(power_in, 1e-30)
+        # Downward: Poynting flux ratio (time-domain / time-domain)
+        flux_efficiency_down = total_down_flux / jnp.maximum(total_in_flux, 1e-30)
+        # Output: mode overlap ratio (frequency-domain / frequency-domain)
         flux_efficiency_out = power_out / jnp.maximum(power_in, 1e-30)
 
         # --- Gaussian overlap (mode quality of downward emission) ---
@@ -685,6 +705,7 @@ def main(
 
         new_info = {
             "power_in": power_in,
+            "total_in_flux": total_in_flux,
             "total_down_flux": total_down_flux,
             "power_out": power_out,
             "flux_efficiency_down": flux_efficiency_down,
