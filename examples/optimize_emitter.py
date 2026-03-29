@@ -252,38 +252,47 @@ def main(
     voxel_size = resolution  # match resolution
 
     # Device in Si layer: patterns Si vs SiO2
-    # 3 etch levels in z — PillarDiscretization enforces that lower layers
-    # must be Si for upper layers to be Si (top-down etch constraint).
-    # StandardToInversePermittivityRange maps [0,1] params into inv-perm
-    # space so PillarDiscretization's distance metric is physically correct.
+    # 3 separate layers for etch levels — fabrication constraint (no floating Si)
+    # is enforced via a penalty in the loss function rather than PillarDiscretization.
     si_device_materials = {
         "SiO2": mat_sio2,
         "Silicon": mat_si,
     }
-    si_device = fdtdx.Device(
-        name="Si_Device",
-        partial_real_shape=(device_length_x, device_width_y / 2, t_si),  # 4 x 2 um (half-y)
-        materials=si_device_materials,
-        param_transforms=[
-            fdtdx.TanhProjection(),
-            fdtdx.StandardToInversePermittivityRange(),
-            fdtdx.PillarDiscretization(axis=2, single_polymer_columns=True),
-            fdtdx.GaussianSmoothing2D(std_discrete=3),
-        ],
-        partial_voxel_real_shape=(voxel_size, voxel_size, None),
-        partial_voxel_grid_shape=(None, None, n_si_etch_levels),
-    )
-    # Si device sits at BOX top: oxide_stack bottom + t_box
-    # y-edge at PMC boundary (min_y), centered in x
-    placement_constraints.extend([
-        si_device.place_relative_to(
-            oxide_stack, axes=2, own_positions=-1, other_positions=-1,
-            margins=t_box,
-        ),
-        si_device.place_at_center(volume, axes=0),
-        si_device.place_relative_to(volume, axes=1, own_positions=-1, other_positions=-1),
-    ])
-    object_list.append(si_device)
+    # Etch levels at 90nm, 150nm, 220nm → layer thicknesses (bottom to top)
+    si_etch_levels = [90e-9, 150e-9, 220e-9]
+    si_layer_thicknesses = [
+        si_etch_levels[0],                                    # 90 nm
+        si_etch_levels[1] - si_etch_levels[0],                # 60 nm
+        si_etch_levels[2] - si_etch_levels[1],                # 70 nm
+    ]
+
+    si_layers: list[fdtdx.Device] = []
+    z_offset = 0.0
+    for i in range(n_si_etch_levels):
+        t_layer = si_layer_thicknesses[i]
+        layer = fdtdx.Device(
+            name=f"Si_Layer_{i}",
+            partial_real_shape=(device_length_x, device_width_y / 2, t_layer),
+            materials=si_device_materials,
+            param_transforms=[
+                fdtdx.TanhProjection(),
+                fdtdx.StandardToInversePermittivityRange(),
+            ],
+            partial_voxel_real_shape=(voxel_size, voxel_size, t_layer),
+        )
+        # Each layer sits at BOX top + cumulative offset for its etch level
+        # y-edge at PMC boundary (min_y), centered in x
+        placement_constraints.extend([
+            layer.place_relative_to(
+                oxide_stack, axes=2, own_positions=-1, other_positions=-1,
+                margins=t_box + z_offset,
+            ),
+            layer.place_at_center(volume, axes=0),
+            layer.place_relative_to(volume, axes=1, own_positions=-1, other_positions=-1),
+        ])
+        si_layers.append(layer)
+        object_list.append(layer)
+        z_offset += t_layer
 
     # Device in SiN layer: patterns SiN vs SiO2
     sin_device_materials = {
@@ -323,7 +332,7 @@ def main(
     )
     placement_constraints.extend([
         waveguide_in.place_relative_to(volume, axes=1, own_positions=-1, other_positions=-1),
-        waveguide_in.place_relative_to(si_device, axes=0, own_positions=1, other_positions=-1),
+        waveguide_in.place_relative_to(si_layers[0], axes=0, own_positions=1, other_positions=-1),
         waveguide_in.place_relative_to(
             oxide_stack, axes=2, own_positions=-1, other_positions=-1,
             margins=t_box,
@@ -342,7 +351,7 @@ def main(
     )
     placement_constraints.extend([
         waveguide_out.place_relative_to(volume, axes=1, own_positions=-1, other_positions=-1),
-        waveguide_out.place_relative_to(si_device, axes=0, own_positions=-1, other_positions=1),
+        waveguide_out.place_relative_to(si_layers[0], axes=0, own_positions=-1, other_positions=1),
         waveguide_out.place_relative_to(
             oxide_stack, axes=2, own_positions=-1, other_positions=-1,
             margins=t_box,
@@ -600,6 +609,7 @@ def main(
     # Remainder (1 - radiation_fraction) targets the output waveguide.
     # Examples: 0.5 = 50/50,  0.3 = 30% up / 70% waveguide
     radiation_fraction = 0.5
+    fab_weight = 0.1  # weight for fabrication penalty (no floating Si)
 
     # Gaussian target parameters for overlap computation.
     # The focal point is 10 μm below the center of the silicon device layer.
@@ -616,7 +626,7 @@ def main(
     # Diffraction-limited beam waist: w₀ = √(λ₀ · f / (π · n))
     # This is the tightest Gaussian focus at distance f (Rayleigh range = f).
     focal_beam_waist = float(jnp.sqrt(wavelength * focal_distance_from_si / (jnp.pi * n_sio2)))
-    focal_x_offset = 10.0/2 - 0.775/2  # beam centered on device
+    focal_x_offset = (10.0e-6 - 0.775e-6) / 2  # beam centered on device
 
     beam_waist_cells = focal_beam_waist / resolution
     x_offset_cells = focal_x_offset / resolution
@@ -684,6 +694,12 @@ def main(
             propagation_sign=-1.0,  # downward emission: focus is below the detector
         )
 
+        # Fabrication penalty: no floating Si (upper etch level needs support below)
+        fab_penalty = 0.0
+        for i in range(n_si_etch_levels - 1):
+            diff = params[si_layers[i + 1].name] - params[si_layers[i].name]
+            fab_penalty = fab_penalty + jnp.mean(jnp.maximum(0.0, diff) ** 2)
+
         # Ratio-targeting objective using a bottleneck metric.
         # Normalize each efficiency to its target fraction, then take the minimum.
         # The result peaks at 1.0 only when both terms simultaneously meet their
@@ -691,7 +707,7 @@ def main(
         # Multiplying by the Gaussian overlap ties mode quality into the objective.
         norm_down = flux_efficiency_down / radiation_fraction
         norm_out = flux_efficiency_out / (1.0 - radiation_fraction)
-        objective = jnp.minimum(norm_down, norm_out) * overlap
+        objective = jnp.minimum(norm_down, norm_out) * overlap - fab_weight * fab_penalty
 
         if evaluation and backward:
             _, arrays = fdtdx.full_backward(
@@ -711,6 +727,7 @@ def main(
             "flux_efficiency_down": flux_efficiency_down,
             "flux_efficiency_out": flux_efficiency_out,
             "gaussian_overlap": overlap,
+            "fab_penalty": fab_penalty,
             "objective": objective,
             **info,
         }
