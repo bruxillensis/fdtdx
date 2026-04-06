@@ -29,6 +29,7 @@ import time
 import chex
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import optax
 import pytreeclass as tc
 from loguru import logger
@@ -128,6 +129,88 @@ def gaussian_overlap(
     gauss_power = jnp.sum(jnp.abs(gauss) ** 2)
 
     return overlap_power / jnp.maximum(field_power * gauss_power, 1e-30)
+
+
+def plot_downward_profile(
+    phasor_field: jax.Array,
+    grid_shape_y: int,
+    grid_shape_x: int,
+    beam_waist_cells: float,
+    x_offset_cells: float,
+    z_focal_cells: float,
+    n_medium: float,
+    wavelength_cells: float,
+    resolution: float,
+    save_path,
+):
+    """Plot the simulated downward field profile against the target Gaussian."""
+    xs = jnp.arange(grid_shape_x) - (grid_shape_x - 1) / 2.0
+    ys = jnp.arange(grid_shape_y)
+    xx, yy = jnp.meshgrid(xs, ys, indexing="ij")
+
+    # Reconstruct target Gaussian (same as in gaussian_overlap)
+    wavelength_med_cells = wavelength_cells / n_medium
+    z_R = jnp.pi * beam_waist_cells**2 / wavelength_med_cells
+    d = jnp.sqrt(x_offset_cells**2 + z_focal_cells**2)
+    w_det = beam_waist_cells * jnp.sqrt(1.0 + (d / z_R) ** 2)
+    R_det = d * (1.0 + (z_R / d) ** 2)
+    theta = jnp.arctan2(x_offset_cells, z_focal_cells)
+    k = 2.0 * jnp.pi * n_medium / wavelength_cells
+
+    rho_sq = xx**2 * jnp.cos(theta) ** 2 + yy**2
+    amplitude = jnp.exp(-rho_sq / w_det**2)
+    phase = -1.0 * (-k * rho_sq / (2.0 * R_det)) + k * xx * jnp.sin(theta)
+    gauss = amplitude * jnp.exp(1j * phase)
+
+    # Simulated field: sum intensity over components
+    phasor_2d = phasor_field[0, :, :, :, 0]  # (num_components, Nx, Ny)
+    sim_intensity = jnp.sum(jnp.abs(phasor_2d) ** 2, axis=0)  # (Nx, Ny)
+    gauss_intensity = jnp.abs(gauss) ** 2
+
+    # Normalize both to peak=1
+    sim_norm = sim_intensity / jnp.maximum(sim_intensity.max(), 1e-30)
+    gauss_norm = gauss_intensity / jnp.maximum(gauss_intensity.max(), 1e-30)
+
+    # Convert grid cells to microns
+    xs_um = float(resolution * 1e6) * xs
+    ys_um = float(resolution * 1e6) * ys
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    # 1D cut along x at y=0
+    ax = axes[0]
+    ax.plot(xs_um, sim_norm[:, 0], label="Simulated", linewidth=1.5)
+    ax.plot(xs_um, gauss_norm[:, 0], "--", label="Target Gaussian", linewidth=1.5)
+    ax.set_xlabel("x (μm)")
+    ax.set_ylabel("Normalized intensity")
+    ax.set_title("x-cut at y=0")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 2D simulated
+    ax = axes[1]
+    extent = [float(ys_um[0]), float(ys_um[-1]), float(xs_um[0]), float(xs_um[-1])]
+    im = ax.imshow(
+        sim_norm, aspect="auto", origin="lower", extent=extent, cmap="inferno"
+    )
+    ax.set_xlabel("y (μm)")
+    ax.set_ylabel("x (μm)")
+    ax.set_title("Simulated |E|²")
+    plt.colorbar(im, ax=ax)
+
+    # 2D target
+    ax = axes[2]
+    im = ax.imshow(
+        gauss_norm, aspect="auto", origin="lower", extent=extent, cmap="inferno"
+    )
+    ax.set_xlabel("y (μm)")
+    ax.set_ylabel("x (μm)")
+    ax.set_title("Target Gaussian |E|²")
+    plt.colorbar(im, ax=ax)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
 
 
 def main(
@@ -569,12 +652,17 @@ def main(
         opt_state: optax.OptState = optimizer.init(params)
 
     # Beta schedule for binarization
+    # Two-phase ramp: linear 0.1→50 for 90% of epochs, then linear 50→200 for the
+    # remaining 10%.  Avoids the previous jnp.inf jump that destabilized the last
+    # few epochs.
     def custom_schedule(idx: chex.Numeric) -> chex.Numeric:
-        beta_schedule = optax.linear_schedule(0.1, 50, epochs)
+        phase1_end = round(0.9 * epochs)
+        phase1 = optax.linear_schedule(0.1, 50, phase1_end)
+        phase2 = optax.linear_schedule(50, 200, epochs - phase1_end)
         return jax.lax.cond(
-            idx < epochs - 2,
-            lambda: beta_schedule(idx),
-            lambda: jnp.inf,
+            idx < phase1_end,
+            lambda: phase1(idx),
+            lambda: phase2(idx - phase1_end),
         )
 
     # ------------------------------------------------------------------
@@ -803,6 +891,22 @@ def main(
 
         exp_logger.write(info)
         exp_logger.progress.update(optim_task_id, advance=1)
+
+        # Plot downward profile vs target Gaussian
+        phasor_data = arrays.detector_states[phasor_detector.name]["phasor"]
+        phasor_field = phasor_data[0]  # (num_freq, num_components, Nx, Ny, 1)
+        plot_downward_profile(
+            phasor_field=phasor_field,
+            grid_shape_y=phasor_field.shape[3],
+            grid_shape_x=phasor_field.shape[2],
+            beam_waist_cells=beam_waist_cells,
+            x_offset_cells=x_offset_cells,
+            z_focal_cells=z_focal_cells,
+            n_medium=n_sio2,
+            wavelength_cells=wavelength_cells,
+            resolution=resolution,
+            save_path=exp_logger.cwd / "figures" / f"downward_profile_{epoch:04d}.png",
+        )
 
         if epoch % 25 == 0:
             logger.info(
