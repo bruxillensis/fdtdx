@@ -698,6 +698,7 @@ def main(
     # Examples: 0.5 = 50/50,  0.3 = 30% up / 70% waveguide
     radiation_fraction = 0.5
     fab_weight = 0.1  # weight for fabrication penalty (no floating Si)
+    overlap_weight = 0.5  # additive weight for Gaussian overlap (mode quality)
 
     # Gaussian target parameters for overlap computation.
     # The focal point is 10 μm below the center of the silicon device layer.
@@ -795,7 +796,8 @@ def main(
         # Multiplying by the Gaussian overlap ties mode quality into the objective.
         norm_down = flux_efficiency_down / radiation_fraction
         norm_out = flux_efficiency_out / (1.0 - radiation_fraction)
-        objective = jnp.minimum(norm_down, norm_out) * overlap - fab_weight * fab_penalty
+        splitting_obj = jnp.minimum(norm_down, norm_out) * overlap
+        objective = splitting_obj + overlap_weight * overlap - fab_weight * fab_penalty
 
         if evaluation and backward:
             _, arrays = fdtdx.full_backward(
