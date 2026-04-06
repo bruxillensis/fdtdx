@@ -358,8 +358,8 @@ def main(
             partial_real_shape=(device_length_x, device_width_y / 2, t_layer),
             materials=si_device_materials,
             param_transforms=[
-                fdtdx.TanhProjection(),
-                fdtdx.StandardToInversePermittivityRange(),
+                fdtdx.GaussianSmoothing2D(std_discrete=3),
+                fdtdx.SubpixelSmoothedProjection(),
             ],
             partial_voxel_real_shape=(voxel_size, voxel_size, t_layer),
         )
