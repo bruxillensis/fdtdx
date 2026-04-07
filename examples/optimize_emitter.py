@@ -17,8 +17,9 @@ downward- and upward-propagating light at the boundaries.
 
 The script defines two Device regions (one in the Si layer, one in the SiN layer)
 that are jointly optimized via gradient descent. The figure of merit is the sum of
-(a) coherent Gaussian overlap at a detector plane 0.35 μm above the BOX bottom
-    (downward emission, converging to a focal point below the detector) and
+(a) coherent Gaussian overlap computed by angular-spectrum-propagating the phasor
+    from a detector plane 0.35 μm above the BOX bottom to the far-field focal plane,
+    then comparing with the target Gaussian at its waist (downward emission) and
 (b) the fraction of input power coupled into the output waveguide, weighted by the
     user-specified radiation_fraction split ratio.
 """
@@ -45,49 +46,111 @@ PERMITTIVITY_SIN = 4.0  # Si3N4 at 1550 nm (n~2.0)
 PERMITTIVITY_AIR = fdtdx.constants.relative_permittivity_air  # 1.0
 
 
+def angular_spectrum_propagate(
+    field_2d: jax.Array,
+    dz_cells: float,
+    n_medium: float,
+    wavelength_cells: float,
+) -> jax.Array:
+    """Propagate a 2D complex field by distance dz using the angular spectrum method.
+
+    Args:
+        field_2d: complex array of shape (Nx, Ny).
+        dz_cells: propagation distance in grid cells (positive = away from source).
+        n_medium: refractive index of the propagation medium.
+        wavelength_cells: free-space wavelength in grid cells.
+
+    Returns:
+        Propagated complex field of same shape (Nx, Ny).
+    """
+    nx, ny = field_2d.shape
+    k = 2.0 * jnp.pi * n_medium / wavelength_cells
+
+    # Spatial frequency grids (cycles per cell → rad per cell)
+    kx = jnp.fft.fftfreq(nx) * 2.0 * jnp.pi
+    ky = jnp.fft.fftfreq(ny) * 2.0 * jnp.pi
+    kx_grid, ky_grid = jnp.meshgrid(kx, ky, indexing="ij")
+
+    # kz: propagating modes have k² > kx²+ky²; evanescent modes get kz=0 (decay, don't propagate)
+    kt_sq = kx_grid**2 + ky_grid**2
+    kz = jnp.sqrt(jnp.maximum(k**2 - kt_sq, 0.0))
+
+    spectrum = jnp.fft.fft2(field_2d)
+    propagated_spectrum = spectrum * jnp.exp(1j * kz * dz_cells)
+    return jnp.fft.ifft2(propagated_spectrum)
+
+
+def _propagate_phasor_to_focal_plane(
+    phasor_2d: jax.Array,
+    grid_shape_x: int,
+    grid_shape_y: int,
+    propagation_distance_cells: float,
+    n_medium: float,
+    wavelength_cells: float,
+) -> jax.Array:
+    """Mirror half-domain phasor (PMC symmetry), propagate to focal plane, crop back.
+
+    Args:
+        phasor_2d: complex array of shape (num_components, Nx, Ny) — half y-domain.
+        grid_shape_x: number of grid cells in x.
+        grid_shape_y: number of grid cells in y (half-domain).
+        propagation_distance_cells: distance to propagate in grid cells.
+        n_medium: refractive index.
+        wavelength_cells: free-space wavelength in grid cells.
+
+    Returns:
+        Propagated field of shape (num_components, Nx, Ny) — cropped back to half-domain.
+    """
+    num_components = phasor_2d.shape[0]
+    # Mirror about y=0 for full domain: [..., y2, y1, y0, y1, y2, ...]
+    # phasor_2d[:, :, 0] is at y=0 (PMC plane); reflect to get negative-y half
+    mirrored = jnp.concatenate([phasor_2d[:, :, :0:-1], phasor_2d], axis=2)  # (C, Nx, 2*Ny-1)
+
+    propagated_components = []
+    for c in range(num_components):
+        prop = angular_spectrum_propagate(
+            mirrored[c],
+            dz_cells=propagation_distance_cells,
+            n_medium=n_medium,
+            wavelength_cells=wavelength_cells,
+        )
+        propagated_components.append(prop)
+    propagated_full = jnp.stack(propagated_components, axis=0)  # (C, Nx, 2*Ny-1)
+
+    # Crop back to the y>=0 half
+    return propagated_full[:, :, grid_shape_y - 1 :]
+
+
 def gaussian_overlap(
     phasor: jax.Array,
     grid_shape_y: int,
     grid_shape_x: int,
     beam_waist_cells: float,
     x_offset_cells: float,
-    z_focal_cells: float,
+    propagation_distance_cells: float,
     n_medium: float,
     wavelength_cells: float,
     propagation_sign: float = 1.0,
 ) -> jax.Array:
-    """Compute coherent overlap of phasor field with a focused Gaussian beam profile.
+    """Compute coherent overlap of a propagated phasor field with a Gaussian beam at its waist.
 
-    The target profile is the cross-section at the detector plane of a Gaussian beam
-    whose waist (focus) is at (x_offset, 0, ±z_focal) relative to the detector. The
-    profile accounts for beam spreading, wavefront curvature, and propagation angle.
+    The near-field phasor recorded at the detector is propagated to the focal plane
+    using the angular spectrum method, then compared with the target Gaussian at its
+    waist (focus). This avoids near-field artifacts that degrade the overlap metric.
 
-    Coordinate convention:
-      - x: centered on detector (emitter center at x=0)
-      - y: starts at 0 (PMC symmetry plane = beam center)
-      - z: detector at z=0; focus is at z = propagation_sign * z_focal
-
-    The beam axis runs from the detector through (x_offset, 0, propagation_sign*z_focal).
-
-      - Transverse distance from axis: ρ² = x²·cos²θ + y²  (θ = arctan(x_offset/z_focal))
-      - Beam radius:  w(d) = w₀·√(1 + (d/z_R)²),  d = √(x_offset²+z_focal²)
-      - Curvature:    R(d) = d·(1 + (z_R/d)²)
-      - Tilt carrier: exp(ik·x·sinθ)
-
-    For downward-propagating beams (focus below detector) pass propagation_sign=-1.0.
-    This flips the sign of the wavefront curvature phase so the mode converges in the
-    correct direction.
+    The target Gaussian at the focal plane is simply exp(-ρ²/w₀²) with a tilt carrier
+    exp(ik·x·sinθ) — no curvature term, since we evaluate at the waist.
 
     Uses complex inner product |⟨E, G⟩|² / (⟨E,E⟩·⟨G,G⟩).
 
     Args:
         phasor: complex array of shape (num_freq, num_components, Nx, Ny, 1).
-        grid_shape_y: number of grid cells in y.
+        grid_shape_y: number of grid cells in y (half-domain, PMC symmetry).
         grid_shape_x: number of grid cells in x.
         beam_waist_cells: Gaussian beam waist w₀ at the focal point, in grid cells.
         x_offset_cells: x-position of the focal point relative to detector center, in grid cells.
-        z_focal_cells: z-distance from detector plane to focal point (always positive), in grid cells.
-        n_medium: refractive index of the medium at the detector (e.g. 1.5 for SiO₂).
+        propagation_distance_cells: distance from detector to focal plane, in grid cells.
+        n_medium: refractive index of the medium (e.g. 1.5 for SiO₂).
         wavelength_cells: free-space wavelength λ₀ in grid cells (= λ₀ / resolution).
         propagation_sign: +1.0 for upward emission (focus above detector),
                           -1.0 for downward emission (focus below detector).
@@ -95,37 +158,33 @@ def gaussian_overlap(
     Returns:
         Real scalar overlap in [0, 1].
     """
+    # Propagate phasor to the focal plane
+    phasor_2d = phasor[0, :, :, :, 0]  # (num_components, Nx, Ny)
+    prop_field = _propagate_phasor_to_focal_plane(
+        phasor_2d, grid_shape_x, grid_shape_y,
+        propagation_distance_cells=propagation_sign * propagation_distance_cells,
+        n_medium=n_medium,
+        wavelength_cells=wavelength_cells,
+    )
+
+    # Target Gaussian at the focal plane (waist — no curvature)
     xs = jnp.arange(grid_shape_x) - (grid_shape_x - 1) / 2.0
-    ys = jnp.arange(grid_shape_y)  # y=0 at PMC symmetry plane
+    ys = jnp.arange(grid_shape_y)
     xx, yy = jnp.meshgrid(xs, ys, indexing="ij")
 
-    # Beam geometry
-    wavelength_med_cells = wavelength_cells / n_medium          # λ in medium
-    z_R = jnp.pi * beam_waist_cells**2 / wavelength_med_cells   # Rayleigh range
-    d = jnp.sqrt(x_offset_cells**2 + z_focal_cells**2)          # axis-distance to focus
-    w_det = beam_waist_cells * jnp.sqrt(1.0 + (d / z_R) ** 2)  # beam radius at detector
-    R_det = d * (1.0 + (z_R / d) ** 2)                          # radius of curvature
-    theta = jnp.arctan2(x_offset_cells, z_focal_cells)          # tilt angle from z-axis
-    k = 2.0 * jnp.pi * n_medium / wavelength_cells              # wavenumber in grid cells
+    k = 2.0 * jnp.pi * n_medium / wavelength_cells
+    theta = jnp.arctan2(x_offset_cells, propagation_distance_cells)
+    rho_sq = (xx - x_offset_cells) ** 2 + yy**2
 
-    # Transverse distance from the tilted beam axis at the detector plane
-    rho_sq = xx**2 * jnp.cos(theta) ** 2 + yy**2
+    amplitude = jnp.exp(-rho_sq / beam_waist_cells**2)
+    phase = k * xx * jnp.sin(theta)
+    gauss = amplitude * jnp.exp(1j * phase)
 
-    amplitude = jnp.exp(-rho_sq / w_det**2)
-    # Curvature phase flips sign for downward-propagating beam (propagation_sign=-1):
-    #   upward   (+1): exp(-ik·ρ²/2R)  — converges above detector
-    #   downward (-1): exp(+ik·ρ²/2R)  — converges below detector
-    phase = propagation_sign * (-k * rho_sq / (2.0 * R_det)) + k * xx * jnp.sin(theta)
-    gauss = amplitude * jnp.exp(1j * phase)  # complex target field
-
-    # phasor shape: (num_freq, num_components, Nx, Ny, 1)
-    phasor_2d = phasor[0, :, :, :, 0]  # (num_components, Nx, Ny)
-
-    # Coherent overlap per component: ⟨E_i, G⟩ = ∫ E_i · G* dA
-    overlap_per_component = jnp.sum(phasor_2d * jnp.conj(gauss)[None, :, :], axis=(1, 2))
+    # Coherent overlap per component
+    overlap_per_component = jnp.sum(prop_field * jnp.conj(gauss)[None, :, :], axis=(1, 2))
 
     overlap_power = jnp.sum(jnp.abs(overlap_per_component) ** 2)
-    field_power = jnp.sum(jnp.abs(phasor_2d) ** 2)
+    field_power = jnp.sum(jnp.abs(prop_field) ** 2)
     gauss_power = jnp.sum(jnp.abs(gauss) ** 2)
 
     return overlap_power / jnp.maximum(field_power * gauss_power, 1e-30)
@@ -137,39 +196,41 @@ def plot_downward_profile(
     grid_shape_x: int,
     beam_waist_cells: float,
     x_offset_cells: float,
-    z_focal_cells: float,
+    propagation_distance_cells: float,
     n_medium: float,
     wavelength_cells: float,
     resolution: float,
     save_path,
 ):
-    """Plot the simulated downward field profile against the target Gaussian."""
+    """Plot the propagated downward field profile against the target Gaussian at the focal plane."""
+    # Propagate phasor to focal plane
+    phasor_2d = phasor_field[0, :, :, :, 0]  # (num_components, Nx, Ny)
+    prop_field = _propagate_phasor_to_focal_plane(
+        phasor_2d, grid_shape_x, grid_shape_y,
+        propagation_distance_cells=-propagation_distance_cells,  # downward
+        n_medium=n_medium,
+        wavelength_cells=wavelength_cells,
+    )
+
     xs = jnp.arange(grid_shape_x) - (grid_shape_x - 1) / 2.0
     ys = jnp.arange(grid_shape_y)
     xx, yy = jnp.meshgrid(xs, ys, indexing="ij")
 
-    # Reconstruct target Gaussian (same as in gaussian_overlap)
-    wavelength_med_cells = wavelength_cells / n_medium
-    z_R = jnp.pi * beam_waist_cells**2 / wavelength_med_cells
-    d = jnp.sqrt(x_offset_cells**2 + z_focal_cells**2)
-    w_det = beam_waist_cells * jnp.sqrt(1.0 + (d / z_R) ** 2)
-    R_det = d * (1.0 + (z_R / d) ** 2)
-    theta = jnp.arctan2(x_offset_cells, z_focal_cells)
+    # Target Gaussian at focal plane (waist — no curvature)
     k = 2.0 * jnp.pi * n_medium / wavelength_cells
-
-    rho_sq = xx**2 * jnp.cos(theta) ** 2 + yy**2
-    amplitude = jnp.exp(-rho_sq / w_det**2)
-    phase = -1.0 * (-k * rho_sq / (2.0 * R_det)) + k * xx * jnp.sin(theta)
+    theta = jnp.arctan2(x_offset_cells, propagation_distance_cells)
+    rho_sq = (xx - x_offset_cells) ** 2 + yy**2
+    amplitude = jnp.exp(-rho_sq / beam_waist_cells**2)
+    phase = k * xx * jnp.sin(theta)
     gauss = amplitude * jnp.exp(1j * phase)
 
     # Simulated field: sum intensity over components
-    phasor_2d = phasor_field[0, :, :, :, 0]  # (num_components, Nx, Ny)
-    sim_intensity = jnp.sum(jnp.abs(phasor_2d) ** 2, axis=0)  # (Nx, Ny)
+    sim_intensity = jnp.sum(jnp.abs(prop_field) ** 2, axis=0)  # (Nx, Ny)
     gauss_intensity = jnp.abs(gauss) ** 2
 
-    # Normalize both to peak=1
-    sim_norm = sim_intensity / jnp.maximum(sim_intensity.max(), 1e-30)
-    gauss_norm = gauss_intensity / jnp.maximum(gauss_intensity.max(), 1e-30)
+    # Normalize both to unit total power (L2 norm), matching the overlap metric
+    sim_norm = sim_intensity / jnp.maximum(sim_intensity.sum(), 1e-30)
+    gauss_norm = gauss_intensity / jnp.maximum(gauss_intensity.sum(), 1e-30)
 
     # Convert grid cells to microns
     xs_um = float(resolution * 1e6) * xs
@@ -182,7 +243,7 @@ def plot_downward_profile(
     ax.plot(xs_um, sim_norm[:, 0], label="Simulated", linewidth=1.5)
     ax.plot(xs_um, gauss_norm[:, 0], "--", label="Target Gaussian", linewidth=1.5)
     ax.set_xlabel("x (μm)")
-    ax.set_ylabel("Normalized intensity")
+    ax.set_ylabel("Intensity (unit total power)")
     ax.set_title("x-cut at y=0")
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -719,7 +780,7 @@ def main(
 
     beam_waist_cells = focal_beam_waist / resolution
     x_offset_cells = focal_x_offset / resolution
-    z_focal_cells = focal_z_distance / resolution
+    propagation_distance_cells = focal_z_distance / resolution
     wavelength_cells = wavelength / resolution
 
     # ------------------------------------------------------------------
@@ -777,7 +838,7 @@ def main(
             phasor_grid_x,
             beam_waist_cells=beam_waist_cells,
             x_offset_cells=x_offset_cells,
-            z_focal_cells=z_focal_cells,
+            propagation_distance_cells=propagation_distance_cells,
             n_medium=n_sio2,
             wavelength_cells=wavelength_cells,
             propagation_sign=-1.0,  # downward emission: focus is below the detector
@@ -903,7 +964,7 @@ def main(
             grid_shape_x=phasor_field.shape[2],
             beam_waist_cells=beam_waist_cells,
             x_offset_cells=x_offset_cells,
-            z_focal_cells=z_focal_cells,
+            propagation_distance_cells=propagation_distance_cells,
             n_medium=n_sio2,
             wavelength_cells=wavelength_cells,
             resolution=resolution,

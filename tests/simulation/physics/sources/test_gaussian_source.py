@@ -29,11 +29,11 @@ _SIM_TIME = 120e-15
 
 # ── Per-test beam geometry ────────────────────────────────────────────────────
 # Profile test: large beam so σ₀ = 500 nm >> λ/(2π) — Fresnel formula valid
-_PROFILE_DOMAIN_XY = 5e-6    # 100 cells at 50 nm
+_PROFILE_DOMAIN_XY = 5e-6  # 100 cells at 50 nm
 _PROFILE_BEAM_RADIUS = 1.5e-6
 
 # Power test: narrow beam so Gaussian flux << uniform flux
-_POWER_DOMAIN_XY = 4e-6      # 80 cells at 50 nm
+_POWER_DOMAIN_XY = 4e-6  # 80 cells at 50 nm
 _POWER_BEAM_RADIUS = 0.5e-6
 
 _DT_APPROX = 0.99 * _RESOLUTION / (3e8 * np.sqrt(3))
@@ -211,9 +211,9 @@ def test_gaussian_source_spatial_profile():
 
     rel_err = abs(rms_measured - rms_expected) / rms_expected
     assert rel_err < 0.10, (
-        f"Gaussian beam RMS width: measured={rms_measured*1e9:.1f} nm, "
-        f"expected={rms_expected*1e9:.1f} nm "
-        f"(σ₀={sigma0*1e9:.0f} nm, z_det={z_det*1e9:.0f} nm), "
+        f"Gaussian beam RMS width: measured={rms_measured * 1e9:.1f} nm, "
+        f"expected={rms_expected * 1e9:.1f} nm "
+        f"(σ₀={sigma0 * 1e9:.0f} nm, z_det={z_det * 1e9:.0f} nm), "
         f"relative error={rel_err:.2%}"
     )
 
@@ -225,9 +225,7 @@ def test_gaussian_vs_uniform_total_power():
     Both normalized by energy, but Gaussian concentrates in smaller area.
     """
     # Gaussian run — narrow beam so flux is clearly less than the uniform source
-    obj_g, con_g, cfg_g, vol_g, _ = _build_gaussian(
-        beam_radius=_POWER_BEAM_RADIUS, domain_xy=_POWER_DOMAIN_XY
-    )
+    obj_g, con_g, cfg_g, vol_g, _ = _build_gaussian(beam_radius=_POWER_BEAM_RADIUS, domain_xy=_POWER_DOMAIN_XY)
     det_g = fdtdx.PoyntingFluxDetector(
         name="flux",
         partial_grid_shape=(None, None, 1),

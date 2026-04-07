@@ -209,15 +209,15 @@ def test_dipole_in_dielectric_power_scaling():
 def test_dipole_in_dielectric_field_decay():
     """Dipole field decay matches the exact Hertzian-dipole formula.
 
-    A z-polarised point dipole sits at the centre of a dielectric slab
-    (n = 1.5).  Two single-cell phasor detectors are placed on the x-axis
-    at fixed physical distances r₁ = 400 nm and r₂ = 650 nm (intermediate-
-    field regime, kr₁ ≈ 3.8, kr₂ ≈ 6.1 at λ = 1 μm, n = 1.5).  The
-    amplitude ratio amp_near / amp_far is compared with the prediction of the
-    exact Hertzian-dipole formula:
+        A z-polarised point dipole sits at the centre of a dielectric slab
+        (n = 1.5).  Two single-cell phasor detectors are placed on the x-axis
+        at fixed physical distances r₁ = 400 nm and r₂ = 650 nm (intermediate-
+        field regime, kr₁ ≈ 3.8, kr₂ ≈ 6.1 at λ = 1 μm, n = 1.5).  The
+        amplitude ratio amp_near / amp_far is compared with the prediction of the
+        exact Hertzian-dipole formula:
 
-        |E_z(r)| ∝ (k²/r) · sqrt((1 − 1/(kr)²)² + (1/(kr))²)
-.
+            |E_z(r)| ∝ (k²/r) · sqrt((1 − 1/(kr)²)² + (1/(kr))²)
+    .
     """
     obj, con, cfg, vol = _build_dipole_in_medium(eps_r=_EPS_R)
 
@@ -249,6 +249,6 @@ def test_dipole_in_dielectric_field_decay():
     rel_err = abs(measured_ratio - expected_ratio) / expected_ratio
     assert rel_err < _TOLERANCE, (
         f"Field decay ratio amp_near/amp_far={measured_ratio:.3f}, "
-        f"expected {expected_ratio:.3f} (Hertzian dipole, kr₁={k*r1:.2f}, kr₂={k*r2:.2f}), "
+        f"expected {expected_ratio:.3f} (Hertzian dipole, kr₁={k * r1:.2f}, kr₂={k * r2:.2f}), "
         f"relative error={rel_err:.2%}"
     )

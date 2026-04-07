@@ -180,11 +180,11 @@ def test_gaussian_pulse_broadband():
     # f_c ± 1σ = 4e14 / 2e14  →  λ = 750 / 1500 nm
     # f_c ± 2σ = 5e14 / 1e14  →  λ = 600 / 3000 nm
     det_specs = [
-        ("center",   _C / _F_CENTER,             0.0),
-        ("plus1s",   _C / (_F_CENTER + _SIGMA_F), -0.5),
-        ("minus1s",  _C / (_F_CENTER - _SIGMA_F), -0.5),
-        ("plus2s",   _C / (_F_CENTER + 2 * _SIGMA_F), -2.0),
-        ("minus2s",  _C / (_F_CENTER - 2 * _SIGMA_F), -2.0),
+        ("center", _C / _F_CENTER, 0.0),
+        ("plus1s", _C / (_F_CENTER + _SIGMA_F), -0.5),
+        ("minus1s", _C / (_F_CENTER - _SIGMA_F), -0.5),
+        ("plus2s", _C / (_F_CENTER + 2 * _SIGMA_F), -2.0),
+        ("minus2s", _C / (_F_CENTER - 2 * _SIGMA_F), -2.0),
     ]
 
     for name, wl, _ in det_specs:
@@ -207,10 +207,7 @@ def test_gaussian_pulse_broadband():
 
     arrays = _run(objects, constraints, config)
 
-    amps = {
-        name: abs(complex(arrays.detector_states[name]["phasor"][0, 0].ravel()[0]))
-        for name, _, _ in det_specs
-    }
+    amps = {name: abs(complex(arrays.detector_states[name]["phasor"][0, 0].ravel()[0])) for name, _, _ in det_specs}
 
     assert amps["center"] > 1e-20, "Center phasor is zero — pulse not detected"
 

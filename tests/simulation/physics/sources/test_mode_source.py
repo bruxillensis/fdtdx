@@ -200,19 +200,17 @@ def test_mode_source_waveguide_propagation():
     n_eff_measured = k_measured * _WAVELENGTH / (2 * np.pi)
 
     n_clad = np.sqrt(_EPS_SIO2)  # 1.5
-    n_core = np.sqrt(_EPS_SI)   # 3.5
+    n_core = np.sqrt(_EPS_SI)  # 3.5
 
     # Sanity bound
-    assert n_clad < n_eff_measured < n_core, (
-        f"n_eff_measured={n_eff_measured:.3f} outside [{n_clad:.2f}, {n_core:.2f}]"
-    )
+    assert n_clad < n_eff_measured < n_core, f"n_eff_measured={n_eff_measured:.3f} outside [{n_clad:.2f}, {n_core:.2f}]"
 
     # Quantitative comparison against the analytical TE slab mode
     n_eff_analytical = _slab_neff_te(n_core, n_clad, _WAVELENGTH, _WG_HEIGHT)
     rel_err = abs(n_eff_measured - n_eff_analytical) / n_eff_analytical
     assert rel_err < 0.10, (
         f"n_eff_measured={n_eff_measured:.3f}, "
-        f"analytical={n_eff_analytical:.3f} (TE slab, h={_WG_HEIGHT*1e9:.0f} nm), "
+        f"analytical={n_eff_analytical:.3f} (TE slab, h={_WG_HEIGHT * 1e9:.0f} nm), "
         f"relative error={rel_err:.2%}"
     )
 
