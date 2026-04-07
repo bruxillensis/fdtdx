@@ -85,26 +85,35 @@ def _propagate_phasor_to_focal_plane(
     grid_shape_x: int,
     grid_shape_y: int,
     propagation_distance_cells: float,
+    x_offset_cells: float,
     n_medium: float,
     wavelength_cells: float,
-) -> jax.Array:
-    """Mirror half-domain phasor (PMC symmetry), propagate to focal plane, crop back.
+) -> tuple[jax.Array, int]:
+    """Mirror half-domain phasor (PMC symmetry), zero-pad, propagate to focal plane.
+
+    Zero-pads in x to accommodate the lateral beam shift from the tilted propagation,
+    preventing FFT wrap-around artifacts.
 
     Args:
         phasor_2d: complex array of shape (num_components, Nx, Ny) — half y-domain.
         grid_shape_x: number of grid cells in x.
         grid_shape_y: number of grid cells in y (half-domain).
         propagation_distance_cells: distance to propagate in grid cells.
+        x_offset_cells: expected lateral shift in x (used to size the padding).
         n_medium: refractive index.
         wavelength_cells: free-space wavelength in grid cells.
 
     Returns:
-        Propagated field of shape (num_components, Nx, Ny) — cropped back to half-domain.
+        Tuple of (propagated field of shape (num_components, Nx_padded, Ny), x_pad)
+        where x_pad is the number of cells padded on each side of x.
     """
     num_components = phasor_2d.shape[0]
     # Mirror about y=0 for full domain: [..., y2, y1, y0, y1, y2, ...]
-    # phasor_2d[:, :, 0] is at y=0 (PMC plane); reflect to get negative-y half
     mirrored = jnp.concatenate([phasor_2d[:, :, :0:-1], phasor_2d], axis=2)  # (C, Nx, 2*Ny-1)
+
+    # Zero-pad in x to accommodate lateral shift from tilted propagation
+    x_pad = int(abs(x_offset_cells)) + 50  # extra margin for beam width
+    mirrored = jnp.pad(mirrored, ((0, 0), (x_pad, x_pad), (0, 0)))
 
     propagated_components = []
     for c in range(num_components):
@@ -115,10 +124,10 @@ def _propagate_phasor_to_focal_plane(
             wavelength_cells=wavelength_cells,
         )
         propagated_components.append(prop)
-    propagated_full = jnp.stack(propagated_components, axis=0)  # (C, Nx, 2*Ny-1)
+    propagated_full = jnp.stack(propagated_components, axis=0)
 
     # Crop back to the y>=0 half
-    return propagated_full[:, :, grid_shape_y - 1 :]
+    return propagated_full[:, :, grid_shape_y - 1 :], x_pad
 
 
 def gaussian_overlap(
@@ -158,17 +167,19 @@ def gaussian_overlap(
     Returns:
         Real scalar overlap in [0, 1].
     """
-    # Propagate phasor to the focal plane
+    # Propagate phasor to the focal plane (returns padded grid)
     phasor_2d = phasor[0, :, :, :, 0]  # (num_components, Nx, Ny)
-    prop_field = _propagate_phasor_to_focal_plane(
+    prop_field, x_pad = _propagate_phasor_to_focal_plane(
         phasor_2d, grid_shape_x, grid_shape_y,
         propagation_distance_cells=propagation_sign * propagation_distance_cells,
+        x_offset_cells=x_offset_cells,
         n_medium=n_medium,
         wavelength_cells=wavelength_cells,
     )
 
-    # Target Gaussian at the focal plane (waist — no curvature)
-    xs = jnp.arange(grid_shape_x) - (grid_shape_x - 1) / 2.0
+    # Target Gaussian at the focal plane (waist — no curvature) on the padded grid
+    nx_padded = grid_shape_x + 2 * x_pad
+    xs = jnp.arange(nx_padded) - (nx_padded - 1) / 2.0
     ys = jnp.arange(grid_shape_y)
     xx, yy = jnp.meshgrid(xs, ys, indexing="ij")
 
@@ -203,16 +214,18 @@ def plot_downward_profile(
     save_path,
 ):
     """Plot the propagated downward field profile against the target Gaussian at the focal plane."""
-    # Propagate phasor to focal plane
+    # Propagate phasor to focal plane (returns padded grid)
     phasor_2d = phasor_field[0, :, :, :, 0]  # (num_components, Nx, Ny)
-    prop_field = _propagate_phasor_to_focal_plane(
+    prop_field, x_pad = _propagate_phasor_to_focal_plane(
         phasor_2d, grid_shape_x, grid_shape_y,
         propagation_distance_cells=-propagation_distance_cells,  # downward
+        x_offset_cells=x_offset_cells,
         n_medium=n_medium,
         wavelength_cells=wavelength_cells,
     )
 
-    xs = jnp.arange(grid_shape_x) - (grid_shape_x - 1) / 2.0
+    nx_padded = grid_shape_x + 2 * x_pad
+    xs = jnp.arange(nx_padded) - (nx_padded - 1) / 2.0
     ys = jnp.arange(grid_shape_y)
     xx, yy = jnp.meshgrid(xs, ys, indexing="ij")
 
@@ -225,7 +238,7 @@ def plot_downward_profile(
     gauss = amplitude * jnp.exp(1j * phase)
 
     # Simulated field: sum intensity over components
-    sim_intensity = jnp.sum(jnp.abs(prop_field) ** 2, axis=0)  # (Nx, Ny)
+    sim_intensity = jnp.sum(jnp.abs(prop_field) ** 2, axis=0)  # (Nx_padded, Ny)
     gauss_intensity = jnp.abs(gauss) ** 2
 
     # Normalize both to unit total power (L2 norm), matching the overlap metric
