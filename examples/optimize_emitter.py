@@ -27,13 +27,16 @@ The additive form gives the optimizer a useful gradient on either term alone;
 solutions that win on both simultaneously are implicitly rewarded.
 """
 
+import re
 import sys
 import time
+from pathlib import Path
 
 import chex
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import numpy as np
 import optax
 import pytreeclass as tc
 from loguru import logger
@@ -307,10 +310,90 @@ def plot_downward_profile(
     plt.close(fig)
 
 
+def _find_latest_seed_iter(params_dir: Path, device_names: list[str]) -> int:
+    """Return the highest iter_idx for which every device has a saved params file.
+
+    Ignores iter_idx == -1 (the pre-optimization random init).
+    """
+    pattern = re.compile(r"^params_(-?\d+)_(.+)\.npy$")
+    iters_per_device: dict[str, set[int]] = {n: set() for n in device_names}
+    for p in params_dir.iterdir():
+        m = pattern.match(p.name)
+        if not m:
+            continue
+        iter_idx = int(m.group(1))
+        rest = m.group(2)
+        # Match longest device name first so "Si_Layer_0" isn't caught by "Si_Layer_0_somekey"
+        for dev_name in sorted(device_names, key=len, reverse=True):
+            if rest == dev_name or rest.startswith(dev_name + "_"):
+                iters_per_device[dev_name].add(iter_idx)
+                break
+    common = set.intersection(*iters_per_device.values()) if iters_per_device else set()
+    common.discard(-1)
+    if not common:
+        missing = [n for n, s in iters_per_device.items() if not s]
+        raise FileNotFoundError(
+            f"No common iteration across all devices in {params_dir}. "
+            f"Devices with no matching files: {missing}"
+        )
+    return max(common)
+
+
+def _load_seed_params(
+    params: fdtdx.ParameterContainer,
+    seed_dir: Path,
+    iter_idx: int | None,
+) -> fdtdx.ParameterContainer:
+    """Overwrite `params` values with arrays loaded from `{seed_dir}/params_{iter}_{name}.npy`.
+
+    The returned container has the same keys/shapes/dtypes as the input; only values change.
+    """
+    seed_dir = Path(seed_dir)
+    if not seed_dir.is_dir():
+        raise FileNotFoundError(f"Seed directory does not exist: {seed_dir}")
+
+    device_names = list(params.keys())
+    if iter_idx is None:
+        iter_idx = _find_latest_seed_iter(seed_dir, device_names)
+        logger.info(f"Auto-selected latest seed iter_idx={iter_idx} from {seed_dir}")
+    else:
+        logger.info(f"Loading seed iter_idx={iter_idx} from {seed_dir}")
+
+    new_params: fdtdx.ParameterContainer = {}
+    for name, current in params.items():
+        if isinstance(current, dict):
+            loaded: dict[str, jax.Array] = {}
+            for k, v in current.items():
+                path = seed_dir / f"params_{iter_idx}_{name}_{k}.npy"
+                if not path.is_file():
+                    raise FileNotFoundError(f"Missing seed file: {path}")
+                arr = np.load(path)
+                if tuple(arr.shape) != tuple(v.shape):
+                    raise ValueError(
+                        f"Shape mismatch for {name}[{k}]: seed {arr.shape} vs expected {v.shape}"
+                    )
+                loaded[k] = jnp.asarray(arr, dtype=v.dtype)
+            new_params[name] = loaded
+        else:
+            path = seed_dir / f"params_{iter_idx}_{name}.npy"
+            if not path.is_file():
+                raise FileNotFoundError(f"Missing seed file: {path}")
+            arr = np.load(path)
+            if tuple(arr.shape) != tuple(current.shape):
+                raise ValueError(
+                    f"Shape mismatch for {name}: seed {arr.shape} vs expected {current.shape}"
+                )
+            new_params[name] = jnp.asarray(arr, dtype=current.dtype)
+        logger.info(f"  loaded seed for device '{name}'")
+    return new_params
+
+
 def main(
     seed: int,
     evaluation: bool,
     backward: bool,
+    seed_from: str | None = None,
+    seed_iter: int | None = None,
 ):
     logger.info(f"{seed=}")
 
@@ -662,6 +745,9 @@ def main(
         key=subkey,
     )
 
+    if seed_from is not None:
+        params = _load_seed_params(params, Path(seed_from), seed_iter)
+
     start_idx = 0
 
     logger.info(tc.tree_summary(arrays, depth=2))
@@ -926,14 +1012,22 @@ if __name__ == "__main__":
     seed = 0
     evaluation = False
     backward = False
+    seed_from: str | None = None
+    seed_iter: int | None = None
     if len(sys.argv) > 1:
         seed = int(sys.argv[1])
     if len(sys.argv) > 2:
         evaluation = sys.argv[2].lower() in ("true", "1", "eval")
     if len(sys.argv) > 3:
         backward = sys.argv[3].lower() in ("true", "1")
+    if len(sys.argv) > 4:
+        seed_from = sys.argv[4]
+    if len(sys.argv) > 5:
+        seed_iter = None if sys.argv[5].lower() in ("latest", "auto", "") else int(sys.argv[5])
     main(
         seed=seed,
         evaluation=evaluation,
         backward=backward,
+        seed_from=seed_from,
+        seed_iter=seed_iter,
     )
