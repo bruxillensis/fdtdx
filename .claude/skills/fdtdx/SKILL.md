@@ -327,6 +327,117 @@ All state arrays have a leading time dimension: `(num_time_steps_on, ...)`. Use 
 
 **ModeOverlapDetector** — inherits PhasorDetector, always uses all 6 field components. Use `compute_overlap_to_mode()` to get the scalar overlap.
 
+## Optimization Suite
+
+`fdtdx.optimization` (re-exported from `fdtdx`) is the inverse-design driver. Three core abstractions:
+
+- **`LossTerm`** — a `TreeClass` contributing `sign * schedule(epoch) * raw` to the loss. `compute(*, params, objects, arrays, config, epoch) → (scalar, info_dict)`. `__call__` wraps the raw metric with the schedule and auto-injects `{name}_raw`, `{name}_weight`, `{name}_contrib` into the info dict.
+- **`Objective`** (subclass of LossTerm) — driver calls with `sign=-1`. Use for quantities to MAXIMISE (efficiency, overlap).
+- **`Constraint`** (subclass of LossTerm) — driver calls with `sign=+1`. Use for penalties to MINIMISE (fab violations, reflections).
+
+Every term takes `name: str` (frozen, used as info-dict prefix) and `schedule: WeightSchedule` (default `ConstantSchedule(value=1.0)`).
+
+### Weight Schedules (`fdtdx.optimization.schedules`)
+
+All JIT-safe (no Python branching on traced epoch). Shared fields: `epoch_start` (default 0), `epoch_end` (default `None` = unbounded). Returns `0.0` outside `[epoch_start, epoch_end]`.
+
+- **`ConstantSchedule(value=1.0)`** — constant inside window.
+- **`LinearSchedule(start_value=0.0, end_value=1.0)`** — linear ramp.
+- **`ExponentialSchedule(start_value=1e-3, end_value=1.0)`** — log-linear; both bounds must be > 0.
+- **`CosineSchedule(start_value=0.0, end_value=1.0)`** — cosine-eased with zero derivative at endpoints.
+- **`OnOffSchedule(value=1.0)`** — binary on/off (semantically == Constant, documents hard-switch intent).
+
+**Default fab-rule constraints to a ramp** (e.g. `LinearSchedule(0.0, 1.0, epoch_start=0, epoch_end=round(0.9*epochs))`) rather than `ConstantSchedule`, so the optimizer can explore topology freely before binarization tightens. Physics-based objectives/constraints (flux, overlap, back-reflection) are fine at constant weight.
+
+### Wrappers for One-Off Terms
+
+- **`FunctionObjective(name=..., schedule=..., fn=callable)`** — wraps a user callable `fn(*, params, objects, arrays, config, epoch) → (scalar, info_dict)`. No subclassing needed.
+- **`FunctionConstraint(...)`** — same, contributes with `sign=+1`.
+
+### Built-In Manufacturing Constraints
+
+All read `device(params[device_name])` (post-projection density ρ ∈ [0,1]) and use morphology primitives from `fdtdx.optimization.utils.morphology`. Device's `single_voxel_real_shape[0]` gives the XY pitch used to translate meters → odd voxel kernel.
+
+- **`MinLineSpace(device_name, min_line_width_m, min_space_m, beta=8.0, eta_erode=0.75, eta_dilate=0.25)`** — Sigmund-Wang filter-and-project. Penalises solid features thinner than `min_line_width_m` and gaps narrower than `min_space_m`: `mean(thin_line²) + mean(thin_gap²)`. Info keys: `thin_line`, `thin_gap`.
+- **`MinInclusion(inner_device_name, outer_device_name, min_margin_m, beta=8.0, eta=0.75)`** — inner device must lie inside outer device eroded by `min_margin_m`. Last 2 axes (XY) must match; Z broadcasts. Info: `max_violation`, `mean_violation`.
+- **`NoFloatingMaterial(device_stack_names: tuple[str, ...])`** — for a bottom→top stack of etched layers, penalises `mean(ReLU(ρ_above - ρ_below)²)` summed over adjacent pairs. All layers must share shape. Info: `max_excess`, `penalty`. Use this for multi-etch-level devices where upper layers need support below.
+
+### Connectivity
+
+- **`VirtualTemperatureConnectivity(device_name, source_mask, drain_mask, kappa_min=1e-3, kappa_max=1.0, p=3.0, cg_iterations=200, cg_tol=1e-6)`** — solves `-∇·(κ(ρ) ∇T) = source_mask` with `T=0` on `drain_mask` via CG with Jacobi preconditioner; penalty = mean T at source. High T ⇔ design disconnects source from drain. `κ(ρ) = κ_min + (κ_max-κ_min)·ρᵖ` (SIMP). Masks must match `device.ndim` or be 2D/3D (stencil auto-selected).
+
+### Lithography / OPC
+
+- **`LithographyModel(wavelength_m=193e-9, numerical_aperture=0.85, sigma_inner=0.0, sigma_outer=0.7, sigma_transition=0.0, resist_threshold=0.3, resist_sharpness=50.0, num_kernels=20, source_grid_points=41)`** — Hopkins partially-coherent imaging with SOCS compression (top-K eigenpairs of the TCC) + sigmoid resist. Two-stage life cycle:
+  1. Config-only until `.prepare(grid_shape, voxel_pitch_m)` → new model with frozen kernel/eigenvalue leaves. Eigendecomposition runs on numpy at prepare time; fails if voxel pitch is too coarse for NA/λ.
+  2. Prepared model supplies `aerial_image(design) → intensity` and `forward(design) → (printed, aerial)` (printed = sigmoid(sharpness·(aerial - threshold))). Broadcasts over leading axes; last 2 axes are spatial.
+- **`OPCConstraint(device_name, litho_model, target_design=None)`** — `mean((printed - target)²)` where target is `ρ` itself (self-consistency) when `target_design is None`, else the supplied array. Use `OPCConstraint.for_device(device, litho_model, name=..., target_design=...)` to prepare the model on the device's XY grid automatically. Info: `aerial_max`, `aerial_mean`, `mismatch`.
+
+### Physics-Base for Custom Constraints
+
+- **`PhysicsConstraint`** (abstract) — fetches density via `device_name`, clips to `[0, 1]`, squeezes trailing singletons, hands `rho` to `build_penalty(rho) → (scalar, info)`. Extend for density-only constraints.
+- **`LinearSteadyStatePDEConstraint`** (abstract) — solves `A(ρ) u = b(ρ)` with implicit-diff CG (gradients flow through the CG solve via JAX's built-in VJP). Subclasses override `operator(u, rho)` (must be symmetric), `rhs(rho)`, `preconditioner_diag(rho) | None`, and `penalty(u, rho) → (scalar, info)`. Fields: `cg_iterations=200`, `cg_tol=1e-6`. `VirtualTemperatureConnectivity` is the reference example.
+
+### `Optimization` Driver
+
+```python
+opt = fdtdx.Optimization(
+    objects=objects,            # frozen_field — structural, not traced
+    arrays=arrays,              # frozen_field — initial state (JIT-donation-safe)
+    params=params,              # field — traced, primary gradient target
+    config=config,              # frozen_field
+    simulate_fn=simulate_fn,    # (params, arrays, objects, config, key, epoch) → arrays
+    optimizer=optax.adam(...),  # any optax.GradientTransformation
+    objectives=(...,),          # tuple of Objective
+    constraints=(...,),         # tuple of Constraint
+    total_epochs=500,
+    param_clip=(0.0, 1.0),      # applied after every optax update
+    logger=exp_logger,          # optional fdtdx.Logger
+    log_every=1,
+    checkpoint_every=50,
+    checkpoint_dir=None,        # defaults to {logger.cwd}/checkpoints
+)
+final = opt.run(key=key, seed_from=..., seed_iter=..., resume_from=...)
+```
+
+- `simulate_fn` is where you call `fdtdx.apply_params(..., beta=beta_schedule(epoch))` and `fdtdx.run_fdtd(...)`. The driver doesn't hard-code those — users control beta, custom backward passes, etc.
+- `loss_fn` (internal) is `jax.jit`-compiled with `donate_argnames=["arrays"]`; compilation happens once up front.
+- `seed_from` loads params only (resets optax state + epoch). `resume_from` restores params + optax state + epoch + RNG. They are mutually exclusive.
+- Returns a new `Optimization` with updated `params` and `arrays`.
+
+### Utils
+
+- **`fdtdx.build_arg_parser(description=...)`** → pre-populated `argparse.ArgumentParser` with `--seed-rng`, `--evaluation`, `--backward`, `--seed-from PATH`, `--seed-iter IDX|latest`, `--resume-from PATH`. Extend with script-specific flags before `parse_args()`.
+- **`fdtdx.save_checkpoint(dir, *, epoch, params, opt_state, rng_key)`** / **`load_checkpoint(path, *, params_template, opt_state_template, rng_key_template=None)`** — full resume; writes `checkpoint_{epoch:06d}.eqx` + `.json`. `load_checkpoint` accepts either a dir (auto-picks latest) or a direct `.eqx` file.
+- **`fdtdx.load_seed_params(seed_path, params_template, iter_idx=None)`** — reads `params_{iter}_{device}.npy` from a Logger output dir. Auto-selects the highest iter for which every device in `params_template` has a file. Values are replaced; shapes/dtypes must match the template.
+- **Morphology** (`fdtdx.optimization.utils.morphology`, also re-exported): `box_filter_2d`, `gaussian_filter_2d`, `smooth_erosion(rho, k, beta=8.0, eta=0.75)`, `smooth_dilation(rho, k, beta=8.0, eta=0.25)`, `meters_to_odd_kernel(length_m, voxel_pitch_m)` (clamps to ≥3, rounds up to odd). All morphology ops act on the last two axes and broadcast over leading batch axes.
+
+### Typical Script Flow
+
+```python
+parser = fdtdx.build_arg_parser()
+args = parser.parse_args()
+
+# ... construct objects, place_objects, define simulate_fn ...
+
+objectives = (
+    fdtdx.FunctionObjective(name="flux_eff", fn=flux_metric,
+                            schedule=fdtdx.ConstantSchedule(0.5)),
+    fdtdx.FunctionObjective(name="overlap", fn=overlap_metric,
+                            schedule=fdtdx.ConstantSchedule(0.5)),
+)
+constraints = (
+    fdtdx.MinLineSpace(name="ls", device_name="dev",
+                       min_line_width_m=140e-9, min_space_m=140e-9,
+                       schedule=fdtdx.LinearSchedule(
+                           epoch_start=0, epoch_end=round(0.9*epochs),
+                           start_value=0.0, end_value=1.0)),
+)
+
+opt = fdtdx.Optimization(..., objectives=objectives, constraints=constraints)
+final = opt.run(key=key, seed_from=args.seed_from, resume_from=args.resume_from)
+```
+
 ## Testing Patterns
 
 **Three test tiers** (auto-marked via conftest.py):
@@ -385,3 +496,8 @@ assert jnp.all(jnp.isfinite(grads))
 - **Dispersive pole count is max'd globally**: The `num_poles` leading axis size = `objects.max_num_dispersive_poles`. Adding one 3-pole material allocates 3 pole slots for every dispersive cell in the sim; non-dispersive cells still have their `c1/c2/c3` set to zero (ADE term vanishes) but consume array memory.
 - **Dispersive source impedance**: Inside a dispersive medium, never use ε∞ as the source's effective permittivity — call `effective_inv_permittivity` at ω_c. Broadband pulses additionally need the `_temporal_H_filter` path to avoid TFSF leakage at off-carrier frequencies.
 - **Stacking objects with mixed dispersion**: `UniformMaterialObject` always writes a full zero-padded pole-coefficient stack into its `grid_slice`, so placing a non-dispersive object over a dispersive one cleanly overwrites stale coefficients. Rely on this rather than assuming "no dispersion = leave coefficients alone".
+- **WeightSchedule is zero outside `[epoch_start, epoch_end]`** — not just capped. If you use `LinearSchedule` as a generic epoch→value utility (e.g. for beta projection), remember that `schedule(epoch)` returns `0.0` for `epoch > epoch_end`, not the `end_value`. For an unbounded hold past the ramp, leave `epoch_end=None`.
+- **Don't pass `fdtdx.apply_params` beta into `Optimization`** — the driver doesn't know about beta. Plumb beta through your `simulate_fn(params, arrays, objects, config, key, epoch)` callback: `arrays, objects, _ = fdtdx.apply_params(arrays, objects, params, key, beta=beta_schedule(epoch))`.
+- **`LithographyModel` must be `.prepare(...)`d before use** — an un-prepared model has `kernels=None`; calling `aerial_image`/`forward` will crash. Prefer `OPCConstraint.for_device(device, model, ...)` which prepares automatically on the device's XY grid.
+- **`Optimization.arrays` is `frozen_field`** — the initial reference stored on `self` is excluded from the pytree so JIT-donation inside `run()` doesn't break pytreeclass's copy-based `.aset` on the final return. Don't try to trace through `opt.arrays`; treat it as the initial state only.
+- **`seed_from` vs `resume_from`** are mutually exclusive. `seed_from` loads params only (optax state and epoch reset to 0); `resume_from` restores params + optax + epoch + RNG.
