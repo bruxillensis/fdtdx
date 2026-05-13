@@ -136,17 +136,17 @@ def update_E(
     inv_eps = arrays.inv_permittivities
     sigma_E = arrays.electric_conductivity
     c = config.courant_number
-    H_pad = pad_fields_for_boundaries(arrays.H, objects, config)
+    H_pad = pad_fields_for_boundaries(arrays.fields.H, objects, config)
     curl, psi_E = curl_H(
         config,
         H_pad,
-        arrays.psi_E,
+        arrays.fields.psi_E,
         arrays.alpha,
         arrays.kappa,
         arrays.sigma,
         simulate_boundaries,
     )
-    arrays = arrays.aset("psi_E", psi_E)
+    arrays = arrays.aset("fields->psi_E", psi_E)
 
     # Check if we have full anisotropic tensors (shape[0] == 9)
     inv_eps_is_full_tensor = inv_eps.shape[0] == 9
@@ -164,7 +164,7 @@ def update_E(
         # standard update formula using lossless material
         # Component-wise multiplication for diagonally anisotropic materials:
         # E[i, x, y, z] = factor * E[i, x, y, z] + c * curl[i, x, y, z] * inv_eps[i, x, y, z]
-        E = factor * arrays.E + c * curl * inv_eps
+        E = factor * arrays.fields.E + c * curl * inv_eps
 
         # Dispersive (ADE) correction. Non-dispersive cells have c3 = 0, so P_new =
         # c1*P_curr + c2*P_prev and (P_curr - P_new) reduces to a purely historical
@@ -177,10 +177,10 @@ def update_E(
             disp_c2 = arrays.dispersive_c2
             disp_c3 = arrays.dispersive_c3
             assert P_prev is not None and disp_c1 is not None and disp_c2 is not None and disp_c3 is not None
-            # disp_c* are (num_poles, 1, Nx, Ny, Nz); arrays.E is (3, Nx, Ny, Nz).
+            # disp_c* are (num_poles, 1, Nx, Ny, Nz); arrays.fields.E is (3, Nx, Ny, Nz).
             # Right-aligned broadcasting produces (num_poles, 3, Nx, Ny, Nz) without
             # an explicit newaxis — skip the reshape so the HLO stays flat.
-            P_new = disp_c1 * P_curr + disp_c2 * P_prev + disp_c3 * arrays.E
+            P_new = disp_c1 * P_curr + disp_c2 * P_prev + disp_c3 * arrays.fields.E
             delta_sum = jnp.sum(P_curr - P_new, axis=0)
             E = E + inv_eps * delta_sum
             arrays = arrays.aset("dispersive_P_prev", P_curr)
@@ -201,7 +201,7 @@ def update_E(
         A, B = compute_anisotropic_update_matrices(inv_eps, sigma_E, c, eta0)
 
         # We need to pad the fields and curl to account for ghost cells when computing the averages
-        E_pad = pad_fields_for_boundaries(arrays.E, objects, config)
+        E_pad = pad_fields_for_boundaries(arrays.fields.E, objects, config)
         curl_pad = pad_fields_for_boundaries(curl, objects, config)
 
         # Compute the averages of the fields and curl
@@ -221,17 +221,17 @@ def update_E(
         # K = curl(H)
         # Ex <= (Axx * Ex + Axy * x_avg(Ey) + Axz * x_avg(Ez)) +
         #       (Bxx * Kx + Bxy * x_avg(Ky) + Bxz * x_avg(Kz))
-        Ex = (A[0, 0] * arrays.E[0] + A[0, 1] * Ey_x_avg + A[0, 2] * Ez_x_avg) + (
+        Ex = (A[0, 0] * arrays.fields.E[0] + A[0, 1] * Ey_x_avg + A[0, 2] * Ez_x_avg) + (
             B[0, 0] * curl[0] + B[0, 1] * curlHy_x_avg + B[0, 2] * curlHz_x_avg
         )
         # Ey <= (Ayx * y_avg(Ex) + Ayy * Ey + Ayz * y_avg(Ez)) +
         #       (Byx * y_avg(Kx) + Byy * Ky + Byz * y_avg(Kz))
-        Ey = (A[1, 0] * Ex_y_avg + A[1, 1] * arrays.E[1] + A[1, 2] * Ez_y_avg) + (
+        Ey = (A[1, 0] * Ex_y_avg + A[1, 1] * arrays.fields.E[1] + A[1, 2] * Ez_y_avg) + (
             B[1, 0] * curlHx_y_avg + B[1, 1] * curl[1] + B[1, 2] * curlHz_y_avg
         )
         # Ez <= (Azx * z_avg(Ex) + Azy * z_avg(Ey) + Azz * Ez) +
         #       (Bzx * z_avg(Kx) + Bzy * z_avg(Ky) + Bzz * Kz)
-        Ez = (A[2, 0] * Ex_z_avg + A[2, 1] * Ey_z_avg + A[2, 2] * arrays.E[2]) + (
+        Ez = (A[2, 0] * Ex_z_avg + A[2, 1] * Ey_z_avg + A[2, 2] * arrays.fields.E[2]) + (
             B[2, 0] * curlHx_z_avg + B[2, 1] * curlHy_z_avg + B[2, 2] * curl[2]
         )
 
@@ -256,7 +256,7 @@ def update_E(
         )
 
     E = apply_boundary_post_E_update(E, objects)
-    arrays = arrays.at["E"].set(E)
+    arrays = arrays.aset("fields->E", E)
     return arrays
 
 
@@ -281,7 +281,7 @@ def update_E_reverse(
     Returns:
         ArrayContainer: Updated ArrayContainer with reversed E field values
     """
-    E = arrays.E
+    E = arrays.fields.E
     for source in objects.sources:
 
         def _update():
@@ -303,11 +303,11 @@ def update_E_reverse(
     inv_eps = arrays.inv_permittivities
     sigma_E = arrays.electric_conductivity
     c = config.courant_number
-    H_pad = pad_fields_for_boundaries(arrays.H, objects, config)
+    H_pad = pad_fields_for_boundaries(arrays.fields.H, objects, config)
     curl, _ = curl_H(
         config,
         H_pad,
-        arrays.psi_E,
+        arrays.fields.psi_E,
         arrays.alpha,
         arrays.kappa,
         arrays.sigma,
@@ -399,7 +399,7 @@ def update_E_reverse(
         E = jnp.stack((Ex, Ey, Ez), axis=0)
 
     E = apply_boundary_post_E_update(E, objects)
-    arrays = arrays.at["E"].set(E)
+    arrays = arrays.aset("fields->E", E)
 
     return arrays
 
@@ -435,17 +435,17 @@ def update_H(
     inv_mu = arrays.inv_permeabilities
     sigma_H = arrays.magnetic_conductivity
     c = config.courant_number
-    E_pad = pad_fields_for_boundaries(arrays.E, objects, config)
+    E_pad = pad_fields_for_boundaries(arrays.fields.E, objects, config)
     curl, psi_H = curl_E(
         config,
         E_pad,
-        arrays.psi_H,
+        arrays.fields.psi_H,
         arrays.alpha,
         arrays.kappa,
         arrays.sigma,
         simulate_boundaries,
     )
-    arrays = arrays.aset("psi_H", psi_H)
+    arrays = arrays.aset("fields->psi_H", psi_H)
 
     # Check if we have full anisotropic tensors (shape[0] == 9)
     # inv_mu can be a scalar (float) for non-magnetic materials
@@ -462,7 +462,7 @@ def update_H(
             factor = 1 - c * sigma_H / eta0 * inv_mu / 2
 
         # standard update formula for lossless material
-        H = factor * arrays.H - c * curl * inv_mu
+        H = factor * arrays.fields.H - c * curl * inv_mu
 
         if sigma_H is not None:
             # update formula for lossy material. Simplifies to NoOp for conductivity = 0
@@ -479,7 +479,7 @@ def update_H(
         A, B = compute_anisotropic_update_matrices(inv_mu, sigma_H, c, 1 / eta0)
 
         # We need to pad the fields and curl to account for ghost cells when computing the averages
-        H_pad = pad_fields_for_boundaries(arrays.H, objects, config)
+        H_pad = pad_fields_for_boundaries(arrays.fields.H, objects, config)
         curl_pad = pad_fields_for_boundaries(curl, objects, config)
 
         # Compute the averages of the fields and curl
@@ -499,17 +499,17 @@ def update_H(
         # K = curl(E)
         # Hx <= (Axx * Hx + Axy * x_avg(Hy) + Axz * x_avg(Hz)) -
         #       (Bxx * Kx + Bxy * x_avg(Ky) + Bxz * x_avg(Kz))
-        Hx = (A[0, 0] * arrays.H[0] + A[0, 1] * Hy_x_avg + A[0, 2] * Hz_x_avg) - (
+        Hx = (A[0, 0] * arrays.fields.H[0] + A[0, 1] * Hy_x_avg + A[0, 2] * Hz_x_avg) - (
             B[0, 0] * curl[0] + B[0, 1] * curlEy_x_avg + B[0, 2] * curlEz_x_avg
         )
         # Hy <= (Ayx * y_avg(Hx) + Ayy * Hy + Ayz * y_avg(Hz)) -
         #       (Byx * y_avg(Kx) + Byy * Ky + Byz * y_avg(Kz))
-        Hy = (A[1, 0] * Hx_y_avg + A[1, 1] * arrays.H[1] + A[1, 2] * Hz_y_avg) - (
+        Hy = (A[1, 0] * Hx_y_avg + A[1, 1] * arrays.fields.H[1] + A[1, 2] * Hz_y_avg) - (
             B[1, 0] * curlEx_y_avg + B[1, 1] * curl[1] + B[1, 2] * curlEz_y_avg
         )
         # Hz <= (Azx * z_avg(Hx) + Azy * z_avg(Hy) + Azz * Hz) -
         #       (Bzx * z_avg(Kx) + Bzy * z_avg(Ky) + Bzz * Kz)
-        Hz = (A[2, 0] * Hx_z_avg + A[2, 1] * Hy_z_avg + A[2, 2] * arrays.H[2]) - (
+        Hz = (A[2, 0] * Hx_z_avg + A[2, 1] * Hy_z_avg + A[2, 2] * arrays.fields.H[2]) - (
             B[2, 0] * curlEx_z_avg + B[2, 1] * curlEy_z_avg + B[2, 2] * curl[2]
         )
 
@@ -534,7 +534,7 @@ def update_H(
         )
 
     H = apply_boundary_post_H_update(H, objects)
-    arrays = arrays.at["H"].set(H)
+    arrays = arrays.aset("fields->H", H)
     return arrays
 
 
@@ -559,7 +559,7 @@ def update_H_reverse(
     Returns:
         ArrayContainer: Updated ArrayContainer with reversed H field values
     """
-    H = arrays.H
+    H = arrays.fields.H
     for source in objects.sources:
 
         def _update():
@@ -581,11 +581,11 @@ def update_H_reverse(
     inv_mu = arrays.inv_permeabilities
     sigma_H = arrays.magnetic_conductivity
     c = config.courant_number
-    E_pad = pad_fields_for_boundaries(arrays.E, objects, config)
+    E_pad = pad_fields_for_boundaries(arrays.fields.E, objects, config)
     curl, _ = curl_E(
         config,
         E_pad,
-        arrays.psi_H,
+        arrays.fields.psi_H,
         arrays.alpha,
         arrays.kappa,
         arrays.sigma,
@@ -654,7 +654,7 @@ def update_H_reverse(
         H = jnp.stack((Hx, Hy, Hz), axis=0)
 
     H = apply_boundary_post_H_update(H, objects)
-    arrays = arrays.at["H"].set(H)
+    arrays = arrays.aset("fields->H", H)
 
     return arrays
 
@@ -684,8 +684,8 @@ def update_detector_states(
     Returns:
         ArrayContainer: Updated ArrayContainer with new detector states
     """
-    E_pad = pad_fields_for_boundaries(arrays.E, objects, config)
-    H_avg_pad = pad_fields_for_boundaries((H_prev + arrays.H) / 2, objects, config)
+    E_pad = pad_fields_for_boundaries(arrays.fields.E, objects, config)
+    H_avg_pad = pad_fields_for_boundaries((H_prev + arrays.fields.H) / 2, objects, config)
     interpolated_E, interpolated_H = interpolate_fields(
         E_pad=E_pad,
         H_pad=H_avg_pad,
@@ -708,8 +708,8 @@ def update_detector_states(
             d._is_on_at_time_step_arr[time_step],
             helper_fn,
             lambda e, h, _: state[d.name],
-            interpolated_E if d.exact_interpolation else arrays.E,
-            interpolated_H if d.exact_interpolation else arrays.H,
+            interpolated_E if d.exact_interpolation else arrays.fields.E,
+            interpolated_H if d.exact_interpolation else arrays.fields.H,
             d,
         )
     arrays = arrays.aset("detector_states", state)

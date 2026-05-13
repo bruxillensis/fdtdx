@@ -1,7 +1,7 @@
 import jax
 
 from fdtdx.config import SimulationConfig
-from fdtdx.fdtd.container import ArrayContainer, ObjectContainer, SimulationState
+from fdtdx.fdtd.container import ArrayContainer, FieldState, ObjectContainer, SimulationState
 from fdtdx.fdtd.update import collect_interfaces, update_detector_states, update_E, update_H
 from fdtdx.interfaces.state import RecordingState
 from fdtdx.objects.detectors.detector import DetectorState
@@ -58,10 +58,7 @@ def forward_single_args_wrapper(
     # passed as defaulted kwargs so callers can closure-capture them via ``functools.partial``
     # without exposing them as VJP primals.
     arr = ArrayContainer(
-        E=E,
-        H=H,
-        psi_E=psi_E,
-        psi_H=psi_H,
+        fields=FieldState(E=E, H=H, psi_E=psi_E, psi_H=psi_H),
         alpha=alpha,
         kappa=kappa,
         sigma=sigma,
@@ -89,10 +86,10 @@ def forward_single_args_wrapper(
     )
     return (
         state[0],
-        state[1].E,
-        state[1].H,
-        state[1].psi_E,
-        state[1].psi_H,
+        state[1].fields.E,
+        state[1].fields.H,
+        state[1].fields.psi_E,
+        state[1].fields.psi_H,
         state[1].alpha,
         state[1].kappa,
         state[1].sigma,
@@ -143,7 +140,7 @@ def forward(
         SimulationState: Updated simulation state for the next time step
     """
     time_step, arrays = state
-    H_prev = arrays.H
+    H_prev = arrays.fields.H
     arrays = update_E(
         time_step=time_step,
         arrays=arrays,

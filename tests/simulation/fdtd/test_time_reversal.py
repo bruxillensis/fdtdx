@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import fdtdx
 from fdtdx.config import GradientConfig, SimulationConfig
 from fdtdx.fdtd.backward import backward
-from fdtdx.fdtd.container import ArrayContainer
+from fdtdx.fdtd.container import ArrayContainer, FieldState
 from fdtdx.fdtd.fdtd import checkpointed_fdtd, reversible_fdtd
 from fdtdx.fdtd.forward import forward
 from fdtdx.interfaces.recorder import Recorder
@@ -98,7 +98,7 @@ def _build_simulation(boundary_types, bloch_vector=(0.0, 0.0, 0.0)):
 def _add_gradient_config(arrays, config, obj_container):
     """Attach a gradient recorder to the config and arrays."""
     input_shape_dtypes = {}
-    field_dtype = arrays.E.dtype
+    field_dtype = arrays.fields.E.dtype
     for boundary in obj_container.pml_objects:
         cur_shape = boundary.interface_grid_shape()
         extended_shape = (3, *cur_shape)
@@ -130,14 +130,14 @@ def _seed_fields(arrays, key, obj_container=None):
     destroy information during the forward step.
     """
     k1, k2 = jax.random.split(key)
-    E = jax.random.normal(k1, arrays.E.shape, dtype=arrays.E.dtype) * 1e-3
-    H = jax.random.normal(k2, arrays.H.shape, dtype=arrays.H.dtype) * 1e-3
+    E = jax.random.normal(k1, arrays.fields.E.shape, dtype=arrays.fields.E.dtype) * 1e-3
+    H = jax.random.normal(k2, arrays.fields.H.shape, dtype=arrays.fields.H.dtype) * 1e-3
     if obj_container is not None:
         for b in obj_container.boundary_objects:
             E = b.apply_post_E_update(E)
             H = b.apply_post_H_update(H)
-    arrays = arrays.aset("E", E)
-    arrays = arrays.aset("H", H)
+    arrays = arrays.aset("fields->E", E)
+    arrays = arrays.aset("fields->H", H)
     return arrays
 
 
@@ -150,8 +150,8 @@ def _forward_backward_roundtrip(obj_container, arrays, config, has_pml):
     arrays, config = _add_gradient_config(arrays, config, obj_container)
 
     # Save original fields
-    E_original = arrays.E.copy()
-    H_original = arrays.H.copy()
+    E_original = arrays.fields.E.copy()
+    H_original = arrays.fields.H.copy()
 
     # Forward one step
     state_fwd = forward(
@@ -175,7 +175,7 @@ def _forward_backward_roundtrip(obj_container, arrays, config, has_pml):
     )
 
     _, arrays_bwd = state_bwd
-    return E_original, H_original, arrays_bwd.E, arrays_bwd.H
+    return E_original, H_original, arrays_bwd.fields.E, arrays_bwd.fields.H
 
 
 def _multi_step_roundtrip(
@@ -197,7 +197,7 @@ def _multi_step_roundtrip(
     key = jax.random.PRNGKey(42)
     arrays = _seed_fields(arrays, key, obj_container)
 
-    originals = {"E": arrays.E, "H": arrays.H}
+    originals = {"E": arrays.fields.E, "H": arrays.fields.H}
     if seed_dispersive and arrays.dispersive_P_curr is not None:
         # Mask polarization seeds to dispersive cells only — vacuum cells have
         # c1=c2=c3=0 and any nonzero P there would be killed by the forward
@@ -237,7 +237,7 @@ def _multi_step_roundtrip(
         )
 
     _, arr_rec = state
-    reconstructed = {"E": arr_rec.E, "H": arr_rec.H}
+    reconstructed = {"E": arr_rec.fields.E, "H": arr_rec.fields.H}
     if seed_dispersive and arr_rec.dispersive_P_curr is not None:
         reconstructed["P_curr"] = arr_rec.dispersive_P_curr
         reconstructed["P_prev"] = arr_rec.dispersive_P_prev
@@ -419,8 +419,8 @@ class TestTimeReversalDispersiveLorentz:
         key = jax.random.PRNGKey(42)
         k_E, k_H, k_Pc, k_Pp = jax.random.split(key, 4)
 
-        E = jax.random.normal(k_E, arrays.E.shape, dtype=arrays.E.dtype) * 1e-3
-        H = jax.random.normal(k_H, arrays.H.shape, dtype=arrays.H.dtype) * 1e-3
+        E = jax.random.normal(k_E, arrays.fields.E.shape, dtype=arrays.fields.E.dtype) * 1e-3
+        H = jax.random.normal(k_H, arrays.fields.H.shape, dtype=arrays.fields.H.dtype) * 1e-3
         for b in obj.boundary_objects:
             E = b.apply_post_E_update(E)
             H = b.apply_post_H_update(H)
@@ -441,8 +441,8 @@ class TestTimeReversalDispersiveLorentz:
             * disp_mask
         )
 
-        arrays = arrays.aset("E", E)
-        arrays = arrays.aset("H", H)
+        arrays = arrays.aset("fields->E", E)
+        arrays = arrays.aset("fields->H", H)
         arrays = arrays.aset("dispersive_P_curr", P_curr)
         arrays = arrays.aset("dispersive_P_prev", P_prev)
 
@@ -478,8 +478,12 @@ class TestTimeReversalDispersiveLorentz:
         assert arrays_bwd.dispersive_P_curr is not None
         assert arrays_bwd.dispersive_P_prev is not None
 
-        assert jnp.allclose(arrays_bwd.E, E_orig, atol=1e-5), f"E max err: {jnp.max(jnp.abs(arrays_bwd.E - E_orig))}"
-        assert jnp.allclose(arrays_bwd.H, H_orig, atol=1e-5), f"H max err: {jnp.max(jnp.abs(arrays_bwd.H - H_orig))}"
+        assert jnp.allclose(arrays_bwd.fields.E, E_orig, atol=1e-5), (
+            f"E max err: {jnp.max(jnp.abs(arrays_bwd.fields.E - E_orig))}"
+        )
+        assert jnp.allclose(arrays_bwd.fields.H, H_orig, atol=1e-5), (
+            f"H max err: {jnp.max(jnp.abs(arrays_bwd.fields.H - H_orig))}"
+        )
         assert jnp.allclose(arrays_bwd.dispersive_P_curr, Pc_orig, atol=1e-5), (
             f"P_curr max err: {jnp.max(jnp.abs(arrays_bwd.dispersive_P_curr - Pc_orig))}"
         )
@@ -566,8 +570,8 @@ class TestTimeReversalDispersiveLossy:
         key = jax.random.PRNGKey(42)
         k_E, k_H, k_Pc, k_Pp = jax.random.split(key, 4)
 
-        E = jax.random.normal(k_E, arrays.E.shape, dtype=arrays.E.dtype) * 1e-3
-        H = jax.random.normal(k_H, arrays.H.shape, dtype=arrays.H.dtype) * 1e-3
+        E = jax.random.normal(k_E, arrays.fields.E.shape, dtype=arrays.fields.E.dtype) * 1e-3
+        H = jax.random.normal(k_H, arrays.fields.H.shape, dtype=arrays.fields.H.dtype) * 1e-3
         for b in obj.boundary_objects:
             E = b.apply_post_E_update(E)
             H = b.apply_post_H_update(H)
@@ -584,8 +588,8 @@ class TestTimeReversalDispersiveLossy:
             * disp_mask
         )
 
-        arrays = arrays.aset("E", E)
-        arrays = arrays.aset("H", H)
+        arrays = arrays.aset("fields->E", E)
+        arrays = arrays.aset("fields->H", H)
         arrays = arrays.aset("dispersive_P_curr", P_curr)
         arrays = arrays.aset("dispersive_P_prev", P_prev)
 
@@ -620,8 +624,8 @@ class TestTimeReversalDispersiveLossy:
         # Float32 single-step floor is ~1e-5 relative; 1e-4 leaves clear margin
         # but catches an O(0.1%) algebraic factor error.
         rel_tol = 1e-4
-        rel_E = _max_relative_error(arrays_bwd.E, E_orig)
-        rel_H = _max_relative_error(arrays_bwd.H, H_orig)
+        rel_E = _max_relative_error(arrays_bwd.fields.E, E_orig)
+        rel_H = _max_relative_error(arrays_bwd.fields.H, H_orig)
         rel_Pc = _max_relative_error(arrays_bwd.dispersive_P_curr, Pc_orig)
         rel_Pp = _max_relative_error(arrays_bwd.dispersive_P_prev, Pp_orig)
         assert rel_E < rel_tol, f"E rel err: {rel_E:.3e}"
@@ -697,7 +701,7 @@ class TestStrictReversibilityLossy:
     def test_fields_and_polarization_reconstructed_to_machine_precision(self):
         with _x64_enabled():
             obj, arrays, config = self._build()
-            assert arrays.E.dtype == jnp.float64, "Strict test requires float64 fields"
+            assert arrays.fields.E.dtype == jnp.float64, "Strict test requires float64 fields"
             originals, reconstructed = _multi_step_roundtrip(
                 obj, arrays, config, has_pml=False, n_steps=_STRICT_N_STEPS, seed_dispersive=True
             )
@@ -959,10 +963,12 @@ class TestGradientDispersiveLorentz:
     @staticmethod
     def _loss_fn(inv_permittivities, arrays, objects, config, key):
         arrays = ArrayContainer(
-            E=arrays.E,
-            H=arrays.H,
-            psi_E=arrays.psi_E,
-            psi_H=arrays.psi_H,
+            fields=FieldState(
+                E=arrays.fields.E,
+                H=arrays.fields.H,
+                psi_E=arrays.fields.psi_E,
+                psi_H=arrays.fields.psi_H,
+            ),
             alpha=arrays.alpha,
             kappa=arrays.kappa,
             sigma=arrays.sigma,
@@ -980,7 +986,7 @@ class TestGradientDispersiveLorentz:
             dispersive_inv_c2=arrays.dispersive_inv_c2,
         )
         _, out = reversible_fdtd(arrays, objects, config, key, show_progress=False)
-        return jnp.sum(jnp.real(out.E) ** 2)
+        return jnp.sum(jnp.real(out.fields.E) ** 2)
 
     def test_dispersive_arrays_allocated(self):
         _, arrays, _ = self._build()
@@ -1093,10 +1099,12 @@ class TestGradientDispersiveLossy:
     @staticmethod
     def _loss_fn(inv_permittivities, arrays, objects, config, key):
         arrays = ArrayContainer(
-            E=arrays.E,
-            H=arrays.H,
-            psi_E=arrays.psi_E,
-            psi_H=arrays.psi_H,
+            fields=FieldState(
+                E=arrays.fields.E,
+                H=arrays.fields.H,
+                psi_E=arrays.fields.psi_E,
+                psi_H=arrays.fields.psi_H,
+            ),
             alpha=arrays.alpha,
             kappa=arrays.kappa,
             sigma=arrays.sigma,
@@ -1114,7 +1122,7 @@ class TestGradientDispersiveLossy:
             dispersive_inv_c2=arrays.dispersive_inv_c2,
         )
         _, out = reversible_fdtd(arrays, objects, config, key, show_progress=False)
-        return jnp.sum(jnp.real(out.E) ** 2)
+        return jnp.sum(jnp.real(out.fields.E) ** 2)
 
     def test_scene_has_active_loss_and_dispersion(self):
         """Sanity: the medium must actually carry both σ_E and pole coefficients."""
@@ -1267,7 +1275,7 @@ class TestGradientDispersiveLossy:
         """
         with _x64_enabled():
             obj, arrays, config = self._build_float64()
-            assert arrays.E.dtype == jnp.float64
+            assert arrays.fields.E.dtype == jnp.float64
             key = jax.random.PRNGKey(99)
             inv_eps = arrays.inv_permittivities
             _, grads = jax.value_and_grad(TestGradientDispersiveLossy._loss_fn)(inv_eps, arrays, obj, config, key)
@@ -1384,10 +1392,12 @@ class TestGradientMagneticConductivity:
     @staticmethod
     def _loss_fn(inv_permeabilities, arrays, objects, config, key):
         arrays = ArrayContainer(
-            E=arrays.E,
-            H=arrays.H,
-            psi_E=arrays.psi_E,
-            psi_H=arrays.psi_H,
+            fields=FieldState(
+                E=arrays.fields.E,
+                H=arrays.fields.H,
+                psi_E=arrays.fields.psi_E,
+                psi_H=arrays.fields.psi_H,
+            ),
             alpha=arrays.alpha,
             kappa=arrays.kappa,
             sigma=arrays.sigma,
@@ -1399,7 +1409,7 @@ class TestGradientMagneticConductivity:
             magnetic_conductivity=arrays.magnetic_conductivity,
         )
         _, out = reversible_fdtd(arrays, objects, config, key, show_progress=False)
-        return jnp.sum(jnp.real(out.H) ** 2)
+        return jnp.sum(jnp.real(out.fields.H) ** 2)
 
     def test_gradient_matches_finite_difference_multi_voxel(self):
         with _x64_enabled():
@@ -1451,7 +1461,7 @@ class TestGradientPMLBlochComplex:
         alone would leave the simulation at zero the whole run and the
         gradient would be trivially zero. A CW ``PointDipoleSource`` at the
         volume center drives nonzero complex fields throughout the run so
-        the loss on ``out.E`` genuinely depends on ``inv_permittivities``.
+        the loss on ``out.fields.E`` genuinely depends on ``inv_permittivities``.
         """
         config = SimulationConfig(
             time=_SIM_TIME,
@@ -1517,10 +1527,9 @@ class TestGradientPMLBlochComplex:
     @staticmethod
     def _loss_fn(inv_permittivities, arrays, objects, config, key):
         arrays = ArrayContainer(
-            E=arrays.E,
-            H=arrays.H,
-            psi_E=arrays.psi_E,
-            psi_H=arrays.psi_H,
+            fields=FieldState(
+                E=arrays.fields.E, H=arrays.fields.H, psi_E=arrays.fields.psi_E, psi_H=arrays.fields.psi_H
+            ),
             alpha=arrays.alpha,
             kappa=arrays.kappa,
             sigma=arrays.sigma,
@@ -1535,7 +1544,7 @@ class TestGradientPMLBlochComplex:
         # Loss on the evolved E field (not inv_permittivities) ensures the
         # gradient flows through the Maxwell update via curl * inv_eps.
         # Using |E|^2 handles complex-valued fields (Bloch k ≠ 0).
-        return jnp.sum(jnp.abs(out.E) ** 2)
+        return jnp.sum(jnp.abs(out.fields.E) ** 2)
 
     def test_gradients_are_finite(self):
         obj, arrays, config = self._build()
@@ -1560,8 +1569,8 @@ class TestGradientPMLBlochComplex:
     def test_fields_are_complex(self):
         """Verify the simulation actually uses complex-valued fields."""
         _, arrays, _ = self._build()
-        assert jnp.issubdtype(arrays.E.dtype, jnp.complexfloating)
-        assert jnp.issubdtype(arrays.H.dtype, jnp.complexfloating)
+        assert jnp.issubdtype(arrays.fields.E.dtype, jnp.complexfloating)
+        assert jnp.issubdtype(arrays.fields.H.dtype, jnp.complexfloating)
 
 
 # ── Tests: dispersion coefficient gradients ────────────────────────────────────
@@ -1583,10 +1592,12 @@ def _make_disp_loss_fn(coef_name):
         }
         kwargs[f"dispersive_{coef_name}"] = coef_value
         arr = ArrayContainer(
-            E=arrays.E,
-            H=arrays.H,
-            psi_E=arrays.psi_E,
-            psi_H=arrays.psi_H,
+            fields=FieldState(
+                E=arrays.fields.E,
+                H=arrays.fields.H,
+                psi_E=arrays.fields.psi_E,
+                psi_H=arrays.fields.psi_H,
+            ),
             alpha=arrays.alpha,
             kappa=arrays.kappa,
             sigma=arrays.sigma,
@@ -1602,7 +1613,7 @@ def _make_disp_loss_fn(coef_name):
             **kwargs,
         )
         _, out = _fdtd(arr, objects, config, key, show_progress=False)
-        return jnp.sum(jnp.real(out.E) ** 2)
+        return jnp.sum(jnp.real(out.fields.E) ** 2)
 
     return loss_fn
 
@@ -1642,10 +1653,12 @@ class TestDispersiveCoefficientGradientReversible:
     @staticmethod
     def _loss_fn(dispersive_c3, arrays, objects, config, key):
         arrays = ArrayContainer(
-            E=arrays.E,
-            H=arrays.H,
-            psi_E=arrays.psi_E,
-            psi_H=arrays.psi_H,
+            fields=FieldState(
+                E=arrays.fields.E,
+                H=arrays.fields.H,
+                psi_E=arrays.fields.psi_E,
+                psi_H=arrays.fields.psi_H,
+            ),
             alpha=arrays.alpha,
             kappa=arrays.kappa,
             sigma=arrays.sigma,
@@ -1663,7 +1676,7 @@ class TestDispersiveCoefficientGradientReversible:
             dispersive_inv_c2=arrays.dispersive_inv_c2,
         )
         _, out = reversible_fdtd(arrays, objects, config, key, show_progress=False)
-        return jnp.sum(jnp.real(out.E) ** 2)
+        return jnp.sum(jnp.real(out.fields.E) ** 2)
 
     def test_gradient_through_c3_matches_finite_difference(self):
         obj, arrays, config = self._build()
@@ -1748,10 +1761,12 @@ class TestDispersiveCoefficientGradientCheckpointed:
     @staticmethod
     def _loss_fn(dispersive_c3, arrays, objects, config, key):
         arrays = ArrayContainer(
-            E=arrays.E,
-            H=arrays.H,
-            psi_E=arrays.psi_E,
-            psi_H=arrays.psi_H,
+            fields=FieldState(
+                E=arrays.fields.E,
+                H=arrays.fields.H,
+                psi_E=arrays.fields.psi_E,
+                psi_H=arrays.fields.psi_H,
+            ),
             alpha=arrays.alpha,
             kappa=arrays.kappa,
             sigma=arrays.sigma,
@@ -1769,7 +1784,7 @@ class TestDispersiveCoefficientGradientCheckpointed:
             dispersive_inv_c2=arrays.dispersive_inv_c2,
         )
         _, out = checkpointed_fdtd(arrays, objects, config, key, show_progress=False)
-        return jnp.sum(jnp.real(out.E) ** 2)
+        return jnp.sum(jnp.real(out.fields.E) ** 2)
 
     def test_gradient_through_c3_matches_finite_difference(self):
         obj, arrays, config = self._build()

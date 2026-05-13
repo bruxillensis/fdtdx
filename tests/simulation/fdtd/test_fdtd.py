@@ -17,7 +17,7 @@ import pytest
 
 import fdtdx
 from fdtdx.config import GradientConfig, SimulationConfig
-from fdtdx.fdtd.container import ArrayContainer
+from fdtdx.fdtd.container import ArrayContainer, FieldState
 from fdtdx.fdtd.fdtd import checkpointed_fdtd, reversible_fdtd
 from fdtdx.interfaces.recorder import Recorder
 
@@ -137,11 +137,18 @@ class TestReversibleFdtdGradients:
     """Test that jax.grad flows through the custom VJP of reversible_fdtd."""
 
     def _loss_fn(self, inv_permittivities, arrays, objects, config, key):
+        """L2 loss on the evolved E/H fields after a full forward+backward pass.
+
+        The ``scene`` fixture drives the fields with a CW dipole source so that
+        E/H are nonzero by the end of the run — a nonzero gradient w.r.t.
+        ``inv_permittivities`` then proves the custom VJP propagates through
+        the Maxwell updates rather than passing input ``inv_permittivities``
+        straight through to the output.
+        """
         arrays = ArrayContainer(
-            E=arrays.E,
-            H=arrays.H,
-            psi_E=arrays.psi_E,
-            psi_H=arrays.psi_H,
+            fields=FieldState(
+                E=arrays.fields.E, H=arrays.fields.H, psi_E=arrays.fields.psi_E, psi_H=arrays.fields.psi_H
+            ),
             alpha=arrays.alpha,
             kappa=arrays.kappa,
             sigma=arrays.sigma,
@@ -153,7 +160,7 @@ class TestReversibleFdtdGradients:
             magnetic_conductivity=arrays.magnetic_conductivity,
         )
         _, out = reversible_fdtd(arrays, objects, config, key, show_progress=False)
-        return jnp.sum(out.E**2) + jnp.sum(out.H**2)
+        return jnp.sum(out.fields.E**2) + jnp.sum(out.fields.H**2)
 
     def test_gradients_are_finite(self, scene, key):
         obj, arrays, config = scene
@@ -341,7 +348,7 @@ def _build_magnetic_lossy_scene(dtype):
 def _attach_gradient(arrays, config, obj, method, num_checkpoints=8):
     """Attach a fresh gradient_config + recording_state to the scene."""
     input_shape_dtypes = {}
-    field_dtype = arrays.E.dtype
+    field_dtype = arrays.fields.E.dtype
     for boundary in obj.pml_objects:
         cur_shape = boundary.interface_grid_shape()
         extended_shape = (3, *cur_shape)
@@ -379,10 +386,12 @@ class TestReversibleVsCheckpointedGradient:
     @staticmethod
     def _loss_inv_eps(inv_permittivities, arrays, objects, config, key):
         arrays = ArrayContainer(
-            E=arrays.E,
-            H=arrays.H,
-            psi_E=arrays.psi_E,
-            psi_H=arrays.psi_H,
+            fields=FieldState(
+                E=arrays.fields.E,
+                H=arrays.fields.H,
+                psi_E=arrays.fields.psi_E,
+                psi_H=arrays.fields.psi_H,
+            ),
             alpha=arrays.alpha,
             kappa=arrays.kappa,
             sigma=arrays.sigma,
@@ -410,7 +419,7 @@ class TestReversibleVsCheckpointedGradient:
             arr = TestReversibleVsCheckpointedGradient._loss_inv_eps(inv_eps, arrays, obj, config, None)
             fdtd_impl = reversible_fdtd if method == "reversible" else checkpointed_fdtd
             _, out = fdtd_impl(arr, obj, config, jax.random.PRNGKey(99), show_progress=False)
-            return jnp.sum(jnp.real(out.E) ** 2)
+            return jnp.sum(jnp.real(out.fields.E) ** 2)
 
         loss, grads = jax.value_and_grad(loss_fn)(arrays.inv_permittivities)
         return loss, grads
@@ -446,10 +455,12 @@ class TestReversibleVsCheckpointedGradient:
 
             def loss_fn(inv_mu):
                 arr = ArrayContainer(
-                    E=arrays.E,
-                    H=arrays.H,
-                    psi_E=arrays.psi_E,
-                    psi_H=arrays.psi_H,
+                    fields=FieldState(
+                        E=arrays.fields.E,
+                        H=arrays.fields.H,
+                        psi_E=arrays.fields.psi_E,
+                        psi_H=arrays.fields.psi_H,
+                    ),
                     alpha=arrays.alpha,
                     kappa=arrays.kappa,
                     sigma=arrays.sigma,
@@ -462,7 +473,7 @@ class TestReversibleVsCheckpointedGradient:
                 )
                 fdtd_impl = reversible_fdtd if method == "reversible" else checkpointed_fdtd
                 _, out = fdtd_impl(arr, obj, config, jax.random.PRNGKey(99), show_progress=False)
-                return jnp.sum(jnp.real(out.H) ** 2)
+                return jnp.sum(jnp.real(out.fields.H) ** 2)
 
             return jax.value_and_grad(loss_fn)(arrays.inv_permeabilities)
 
@@ -488,10 +499,12 @@ class TestReversibleVsCheckpointedGradient:
 
             def loss_fn(c3):
                 arr = ArrayContainer(
-                    E=arrays.E,
-                    H=arrays.H,
-                    psi_E=arrays.psi_E,
-                    psi_H=arrays.psi_H,
+                    fields=FieldState(
+                        E=arrays.fields.E,
+                        H=arrays.fields.H,
+                        psi_E=arrays.fields.psi_E,
+                        psi_H=arrays.fields.psi_H,
+                    ),
                     alpha=arrays.alpha,
                     kappa=arrays.kappa,
                     sigma=arrays.sigma,
@@ -510,7 +523,7 @@ class TestReversibleVsCheckpointedGradient:
                 )
                 fdtd_impl = reversible_fdtd if method == "reversible" else checkpointed_fdtd
                 _, out = fdtd_impl(arr, obj, config, jax.random.PRNGKey(99), show_progress=False)
-                return jnp.sum(jnp.real(out.E) ** 2)
+                return jnp.sum(jnp.real(out.fields.E) ** 2)
 
             return jax.value_and_grad(loss_fn)(arrays.dispersive_c3)
 

@@ -44,7 +44,7 @@ from fdtdx.dispersion import (
     compute_pole_coefficients,
 )
 from fdtdx.fdtd.backward import full_backward
-from fdtdx.fdtd.container import ArrayContainer, ObjectContainer, ParameterContainer, SimulationState
+from fdtdx.fdtd.container import ArrayContainer, FieldState, ObjectContainer, ParameterContainer, SimulationState
 from fdtdx.fdtd.initialization import apply_params, place_objects, resolve_object_constraints
 from fdtdx.fdtd.wrapper import run_fdtd
 from fdtdx.interfaces.modules import DtypeConversion
@@ -103,7 +103,12 @@ from fdtdx.objects.object import (
 from fdtdx.objects.sources.dipole import PointDipoleSource
 from fdtdx.objects.sources.linear_polarization import GaussianPlaneSource, UniformPlaneSource
 from fdtdx.objects.sources.mode import ModePlaneSource
-from fdtdx.objects.sources.profile import GaussianPulseProfile, SingleFrequencyProfile
+from fdtdx.objects.sources.profile import (
+    CustomTimeSignalProfile,
+    GaussianPulseProfile,
+    SingleFrequencyProfile,
+    TemporalProfile,
+)
 from fdtdx.objects.static_material.cylinder import Cylinder
 from fdtdx.objects.static_material.polygon import (
     ExtrudedPolygon,
@@ -131,6 +136,7 @@ __all__ = [
     "ClosestIndex",
     "Color",
     "ConnectHolesAndStructures",
+    "CustomTimeSignalProfile",
     "Cylinder",
     "Detector",
     "DetectorState",
@@ -143,6 +149,7 @@ __all__ = [
     "EnergyDetector",
     "ExtrudedPolygon",
     "FieldDetector",
+    "FieldState",
     "GaussianPlaneSource",
     "GaussianPulseProfile",
     "GaussianSmoothing2D",
@@ -190,6 +197,7 @@ __all__ = [
     "StandardToPlusOneMinusOneRange",
     "SubpixelSmoothedProjection",
     "TanhProjection",
+    "TemporalProfile",
     "TreeClass",
     "UniformMaterialObject",
     "UniformPlaneSource",

@@ -263,7 +263,6 @@ def test_static_multi_material_dispersive(simple_config, simple_volume):
     }
     sphere = Sphere(
         name="sphere",
-        partial_grid_shape=(14, 14, 14),
         materials=materials,
         material_name="drude",
         radius=5.0 * simple_config.resolution,
