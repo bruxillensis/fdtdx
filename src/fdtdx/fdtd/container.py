@@ -8,6 +8,7 @@ like sources, detectors, PML boundaries, Bloch/periodic boundaries, and devices.
 from typing import Callable, Self
 
 import jax
+import jax.numpy as jnp
 
 from fdtdx.core.jax.pytrees import TreeClass, autoinit, frozen_field
 from fdtdx.interfaces.state import RecordingState
@@ -256,14 +257,14 @@ class ObjectContainer(TreeClass):
         key: str,
         val: SimulationObject,
     ):
-        idx = -1
-        for cur_idx, o in enumerate(self.objects):
-            if o.name == key:
-                idx = cur_idx
-                break
-        if idx == -1:
-            raise ValueError(f"Key {key} does not exist in object list: {[o.name for o in self.objects]}")
+        idx = self.index(key)
         self.object_list[idx] = val
+
+    def index(self, name: str) -> int:
+        for idx, o in enumerate(self.object_list):
+            if o.name == name:
+                return idx
+        raise ValueError(f"Object '{name}' does not exist in object list: {[o.name for o in self.objects]}")
 
     def copy(
         self,
@@ -284,12 +285,11 @@ class ObjectContainer(TreeClass):
 
 
 @autoinit
-class ArrayContainer(TreeClass):
-    """Container for simulation field arrays and states.
+class FieldState(TreeClass):
+    """Dynamic electromagnetic field state that evolves each time step.
 
-    This class holds the electromagnetic field arrays and various state information
-    needed during FDTD simulation. It includes the E and H fields, material properties,
-    and states for boundaries, detectors and recordings.
+    Grouping these together makes it impossible to forget a field when resetting
+    simulation state — ArrayContainer.reset() zeroes this entire struct at once.
     """
 
     #: Electric field array.
@@ -298,11 +298,24 @@ class ArrayContainer(TreeClass):
     #: Magnetic field array.
     H: jax.Array
 
-    #: Auxiliary electric field array.
+    #: PML auxiliary electric field.
     psi_E: jax.Array
 
-    #: Auxiliary magnetic field array.
+    #: PML auxiliary magnetic field.
     psi_H: jax.Array
+
+
+@autoinit
+class ArrayContainer(TreeClass):
+    """Container for simulation field arrays and states.
+
+    This class holds the electromagnetic field arrays and various state information
+    needed during FDTD simulation. It includes the E and H fields, material properties,
+    and states for boundaries, detectors and recordings.
+    """
+
+    #: Dynamic electromagnetic fields (E, H and PML auxiliaries).
+    fields: FieldState
 
     #: Alpha array for PML calculations.
     alpha: jax.Array
@@ -351,52 +364,58 @@ class ArrayContainer(TreeClass):
     #: ``(num_poles, 1, Nx, Ny, Nz)``. ``None`` for non-dispersive simulations.
     dispersive_c3: jax.Array | None = None
 
+    #: Per-cell cached ``1 / c2`` with non-dispersive cells set to 0. Lets the
+    #: reverse-time ADE update avoid a ``jnp.where`` + division per step.
+    #: Derived from ``dispersive_c2``; never differentiated independently.
+    #: Shape ``(num_poles, 1, Nx, Ny, Nz)``. ``None`` for non-dispersive simulations.
+    dispersive_inv_c2: jax.Array | None = None
+
+    def reset(
+        self,
+        reset_detector_states: bool = True,
+        reset_recording_state: bool = False,
+    ) -> "ArrayContainer":
+        """Return a reset copy of this array container.
+
+        Dynamic field arrays are zeroed while material arrays and conductivity
+        arrays are preserved. Detector states are reset by default because they
+        accumulate time-dependent measurements. Recording state is preserved by
+        default so partial simulations can continue writing to the same buffers.
+
+        Args:
+            reset_detector_states: Whether to zero all detector state arrays.
+                Defaults to True.
+            reset_recording_state: Whether to zero recording data and state
+                arrays when a recording state is present. Defaults to False.
+
+        Returns:
+            A new ArrayContainer with reset dynamic state.
+        """
+        arrays = self.aset("fields", jax.tree.map(jnp.zeros_like, self.fields))
+
+        # Dispersive ADE polarization is also dynamic per-timestep state and must
+        # be zeroed alongside E/H. Coefficient arrays (c1/c2/c3/inv_c2) are
+        # material properties and are preserved.
+        if arrays.dispersive_P_curr is not None:
+            arrays = arrays.aset("dispersive_P_curr", jnp.zeros_like(arrays.dispersive_P_curr))
+        if arrays.dispersive_P_prev is not None:
+            arrays = arrays.aset("dispersive_P_prev", jnp.zeros_like(arrays.dispersive_P_prev))
+
+        detector_states = self.detector_states
+        if reset_detector_states:
+            detector_states = {k: {k2: v2 * 0 for k2, v2 in v.items()} for k, v in detector_states.items()}
+        arrays = arrays.aset("detector_states", detector_states)
+
+        recording_state = self.recording_state
+        if reset_recording_state and self.recording_state is not None:
+            recording_state = RecordingState(
+                data={k: v * 0 for k, v in self.recording_state.data.items()},
+                state={k: v * 0 for k, v in self.recording_state.state.items()},
+            )
+        arrays = arrays.aset("recording_state", recording_state)
+
+        return arrays
+
 
 # time step and arrays
 SimulationState = tuple[jax.Array, ArrayContainer]
-
-
-def reset_array_container(
-    arrays: ArrayContainer,
-    objects: ObjectContainer,
-    reset_detector_states: bool = True,
-    reset_recording_state: bool = False,
-) -> ArrayContainer:
-    """Reset an ArrayContainer's fields and optionally its states.
-
-    This function creates a new ArrayContainer with zeroed E and H fields while preserving
-    material properties. It can optionally reset detector and recording states.
-
-    Args:
-        arrays (ArrayContainer): The ArrayContainer to reset.
-        objects (ObjectContainer): ObjectContainer with simulation objects.
-        reset_detector_states (bool, optional): Whether to zero detector states. Defaults to True.
-        reset_recording_state (bool, optional): Whether to zero recording state. Defaults to False.
-
-    Returns:
-        ArrayContainer: A new ArrayContainer with reset fields and optionally reset states.
-    """
-    E = arrays.E * 0
-    arrays = arrays.aset("E", E)
-    H = arrays.H * 0
-    arrays = arrays.aset("H", H)
-
-    if arrays.dispersive_P_curr is not None:
-        arrays = arrays.aset("dispersive_P_curr", arrays.dispersive_P_curr * 0)
-    if arrays.dispersive_P_prev is not None:
-        arrays = arrays.aset("dispersive_P_prev", arrays.dispersive_P_prev * 0)
-
-    detector_states = arrays.detector_states
-    if reset_detector_states:
-        detector_states = {k: {k2: v2 * 0 for k2, v2 in v.items()} for k, v in detector_states.items()}
-    arrays = arrays.aset("detector_states", detector_states)
-
-    recording_state = arrays.recording_state
-    if reset_recording_state and arrays.recording_state is not None:
-        recording_state = RecordingState(
-            data={k: v * 0 for k, v in arrays.recording_state.data.items()},
-            state={k: v * 0 for k, v in arrays.recording_state.state.items()},
-        )
-    arrays = arrays.aset("recording_state", recording_state)
-
-    return arrays

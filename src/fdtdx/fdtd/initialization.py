@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from fdtdx.config import SimulationConfig
 from fdtdx.core.jax.sharding import create_named_sharded_matrix
 from fdtdx.core.jax.ste import straight_through_estimator
-from fdtdx.fdtd.container import ArrayContainer, ObjectContainer, ParameterContainer
+from fdtdx.fdtd.container import ArrayContainer, FieldState, ObjectContainer, ParameterContainer
 from fdtdx.materials import (
     compute_allowed_dispersive_coefficients,
     compute_allowed_electric_conductivities,
@@ -250,27 +250,25 @@ def apply_params(
             new_c1 = arrays.dispersive_c1.at[:, :, *device.grid_slice].set(new_c1_slice)
             new_c2 = arrays.dispersive_c2.at[:, :, *device.grid_slice].set(new_c2_slice)
             new_c3 = arrays.dispersive_c3.at[:, :, *device.grid_slice].set(new_c3_slice)
+            # Recompute inv_c2 from the post-interpolation c2. Do NOT interpolate
+            # inv_c2 directly: 1/avg(c2) != avg(1/c2), and the reverse-time ADE
+            # relies on inv_c2 being the exact reciprocal of the stored c2.
+            new_inv_c2 = jnp.where(new_c2 == 0, 0.0, 1.0 / new_c2)
             arrays = arrays.at["dispersive_c1"].set(new_c1)
             arrays = arrays.at["dispersive_c2"].set(new_c2)
             arrays = arrays.at["dispersive_c3"].set(new_c3)
+            arrays = arrays.at["dispersive_inv_c2"].set(new_inv_c2)
 
-    # apply random key to sources
+    # apply random key to sources. Source-side sampling of the dispersion
+    # coefficients (used only for carrier-frequency impedance / energy
+    # normalization) is stop_gradient'd to match the treatment of
+    # ``inv_permittivities`` — the FDTD VJP itself still propagates gradient
+    # through the coefficients, so this only avoids noise from the source
+    # amplitude path.
+    disp_c1 = None if arrays.dispersive_c1 is None else jax.lax.stop_gradient(arrays.dispersive_c1)
+    disp_c2 = None if arrays.dispersive_c2 is None else jax.lax.stop_gradient(arrays.dispersive_c2)
+    disp_c3 = None if arrays.dispersive_c3 is None else jax.lax.stop_gradient(arrays.dispersive_c3)
     new_objects = []
-    # Sources only sample the dispersion coefficients for impedance/energy
-    # normalization at their carrier frequency. By default we cut that gradient
-    # path — it's noise for topology optimization. When the user opts in via
-    # GradientConfig.differentiate_dispersion, we let gradients flow through
-    # source sampling too for consistency with the FDTD VJP.
-    first_config = objects.object_list[0]._config if objects.object_list else None
-    differentiate_dispersion = first_config is not None and first_config.differentiate_dispersion
-    if differentiate_dispersion:
-        disp_c1 = arrays.dispersive_c1
-        disp_c2 = arrays.dispersive_c2
-        disp_c3 = arrays.dispersive_c3
-    else:
-        disp_c1 = None if arrays.dispersive_c1 is None else jax.lax.stop_gradient(arrays.dispersive_c1)
-        disp_c2 = None if arrays.dispersive_c2 is None else jax.lax.stop_gradient(arrays.dispersive_c2)
-        disp_c3 = None if arrays.dispersive_c3 is None else jax.lax.stop_gradient(arrays.dispersive_c3)
     for obj in objects.object_list:
         key, subkey = jax.random.split(key)
         new_obj = obj.apply(
@@ -777,11 +775,14 @@ def _init_arrays(
         )
         config = config.aset("gradient_config", grad_cfg)
 
+    # Cache 1/c2 with non-dispersive cells zeroed so update_E_reverse can replace
+    # its ``jnp.where(c2 == 0, ..., / c2)`` pair with a single multiply.
+    dispersive_inv_c2 = None
+    if dispersive_c2 is not None:
+        dispersive_inv_c2 = jnp.where(dispersive_c2 == 0, 0.0, 1.0 / dispersive_c2)
+
     arrays = ArrayContainer(
-        E=E,
-        H=H,
-        psi_E=psi_E,
-        psi_H=psi_H,
+        fields=FieldState(E=E, H=H, psi_E=psi_E, psi_H=psi_H),
         alpha=alpha,
         kappa=kappa,
         sigma=sigma,
@@ -796,6 +797,7 @@ def _init_arrays(
         dispersive_c1=dispersive_c1,
         dispersive_c2=dispersive_c2,
         dispersive_c3=dispersive_c3,
+        dispersive_inv_c2=dispersive_inv_c2,
     )
     return arrays, config, info
 
@@ -859,6 +861,55 @@ def resolve_object_constraints(
     resolved_slices = {}
     for obj_name, slice_list in resolved.items():
         resolved_slices[obj_name] = tuple([(axis_slice_list[0], axis_slice_list[1]) for axis_slice_list in slice_list])
+
+    # Get volume bounds from resolved slices
+    volume_name = _resolve_volume_name({obj.name: obj for obj in objects})
+    volume_slice = resolved_slices.get(volume_name)
+
+    # If the volume itself failed to resolve, skip bounds checks
+    if volume_slice is not None:
+        volume_bounds = tuple((s1, s2) for s1, s2 in volume_slice)
+
+        # Validate all non-volume objects are within simulation volume bounds
+        for obj_name, slice_tuple in resolved_slices.items():
+            if obj_name == volume_name:
+                continue  # Skip the volume itself
+
+            # Check for unresolved bounds first
+            unresolved_axes = []
+            for axis in range(3):
+                s1, s2 = slice_tuple[axis]
+                if s1 is None or s2 is None:
+                    unresolved_axes.append(axis)
+
+            if unresolved_axes:
+                # Ensure unresolved objects are flagged in errors
+                if not errors.get(obj_name):
+                    errors[obj_name] = (
+                        f"Object '{obj_name}' has unresolved bounds on axes {unresolved_axes}. Slice: {slice_tuple}"
+                    )
+                continue
+
+            # Check bounds violations
+            msgs = []
+            for axis in range(3):
+                s1, s2 = slice_tuple[axis]
+                vol_s1, vol_s2 = volume_bounds[axis]
+
+                if s1 < vol_s1:
+                    msgs.append(f"axis {axis}: lower bound {s1} < volume lower bound {vol_s1}")
+                if s2 > vol_s2:
+                    msgs.append(f"axis {axis}: upper bound {s2} > volume upper bound {vol_s2}")
+                if s2 <= s1:
+                    msgs.append(f"axis {axis}: invalid size (lower bound {s1} >= upper bound {s2})")
+
+            if msgs:
+                prev = errors.get(obj_name) or ""
+                errors[obj_name] = (
+                    (prev + "; " if prev else "")
+                    + f"Object '{obj_name}' out of bounds ({slice_tuple} vs volume {volume_bounds}): "
+                    + "; ".join(msgs)
+                )
 
     return resolved_slices, errors
 
@@ -1022,7 +1073,7 @@ def _apply_constraints_iteratively(
     )
 
     # iterate
-    for _ in range(max_iter):
+    for iteration in range(max_iter):
         changed = False
 
         # check if we already resolved everything
@@ -1045,7 +1096,8 @@ def _apply_constraints_iteratively(
         )
         changed = changed or resolved
 
-        # update the grid slices based on static shape and partial known positions
+        # Slices-from-shapes: propagate a known shape to an open bound.
+        # Shapes-from-slices: lock the shape once both bounds are known.
         resolved, slice_dict, errors = _update_grid_slices_from_shapes(
             object_map=object_map,
             shape_dict=shape_dict,
@@ -1122,6 +1174,11 @@ def _apply_constraints_iteratively(
         if not changed:
             errors = _handle_unresolved_objects(object_map=object_map, slice_dict=slice_dict, errors=errors)
             break
+    else:
+        # max_iter reached without convergence
+        # Ensure all unresolved objects are flagged
+        errors = _handle_unresolved_objects(object_map=object_map, slice_dict=slice_dict, errors=errors)
+
     return slice_dict, errors
 
 
@@ -1143,18 +1200,35 @@ def _resolve_static_shapes(
     object_map: dict[str, SimulationObject],
     shape_dict: dict[str, list[int | None]],
     config: SimulationConfig,
-):
-    """Fill in static or directly defined shapes."""
+) -> dict[str, list[int | None]]:
+    """Fill in shapes from each object's partial_real_shape and partial_grid_shape."""
     for obj_name, obj in object_map.items():
         for axis in range(3):
             if obj.partial_grid_shape[axis] is not None:
                 shape_dict[obj_name][axis] = obj.partial_grid_shape[axis]
             if obj.partial_real_shape[axis] is not None:
-                cur_grid_shape = round(
+                shape_dict[obj_name][axis] = round(
                     obj.partial_real_shape[axis] / config.resolution  # type: ignore
                 )
-                shape_dict[obj_name][axis] = cur_grid_shape
     return shape_dict
+
+
+def _record_shape_bound_conflict(
+    obj_name: str,
+    axis: int,
+    bound_size: int,
+    obj: SimulationObject,
+    shape_dict: dict[str, list[int | None]],
+    errors: dict[str, str | None],
+) -> bool:
+    """Record a conflict where shape_dict and bound-derived size disagree. Always an error."""
+    errors[obj_name] = (
+        f"Inconsistent grid shape for object: {shape_dict[obj_name][axis]} != {bound_size} "
+        f"for axis={axis}, {obj.name} ({obj.__class__.__name__}). "
+        f"Check partial_real_shape, partial_grid_shape, and any SizeConstraints for this object. "
+        f"If the shape is derived from geometry (e.g. radius), a conflicting constraint was applied."
+    )
+    return False
 
 
 def _update_grid_slices_from_shapes(
@@ -1175,9 +1249,7 @@ def _update_grid_slices_from_shapes(
                 continue
             elif b0 is not None and b1 is not None:
                 if s_axis != b1 - b0:
-                    errors[obj_name] = (
-                        f"Inconsistent grid shape for object: {s_axis} != {b1 - b0}, {obj.name} ({obj.__class__})."
-                    )
+                    resolved_something |= _record_shape_bound_conflict(obj_name, axis, b1 - b0, obj, shape_dict, errors)
             elif b0 is not None:
                 slice_dict[obj_name][axis][1] = b0 + s_axis
                 resolved_something = True
@@ -1204,10 +1276,8 @@ def _update_grid_shapes_from_slices(
                 if s_axis is None:
                     shape_dict[obj_name][axis] = b1 - b0
                     resolved_something = True
-                elif s_axis is not None and b1 - b0 != s_axis:
-                    errors[obj_name] = (
-                        f"Inconsistent grid shape for object: {s_axis} != {b1 - b0}, {obj.name} ({obj.__class__})."
-                    )
+                elif b1 - b0 != s_axis:
+                    resolved_something |= _record_shape_bound_conflict(obj_name, axis, b1 - b0, obj, shape_dict, errors)
     return resolved_something, shape_dict, errors
 
 
@@ -1356,9 +1426,11 @@ def _apply_size_constraint(
             resolved_something = True
         elif shape_dict[obj_name][axis] != object_shape:
             raise Exception(
-                "Inconsistent grid shape for object: ",
-                f"{shape_dict[obj_name][axis]} != {object_shape} for {axis=}, {obj.name} ({obj.__class__}). ",
-                "Please check if there are multiple constraints or sizes specified for the object.",
+                f"Inconsistent grid shape for object: "
+                f"{shape_dict[obj_name][axis]} != {object_shape} for axis={axis}, "
+                f"{obj.name} ({obj.__class__.__name__}). "
+                f"Check partial_real_shape, partial_grid_shape, and any SizeConstraints for this object. "
+                f"If the shape is derived from geometry (e.g. radius), a conflicting SizeConstraint was applied."
             )
     return resolved_something, shape_dict
 
@@ -1431,6 +1503,20 @@ def _extend_to_inf_if_possible(
                 direction = 0 if c.direction == "-" else 1
                 if (c.object, direction) in extension_obj:
                     extension_obj.remove((c.object, direction))
+
+            # Do not extend objects that have a pending PositionConstraint on this axis.
+            # If the referenced object's bounds are still unknown the constraint cannot resolve
+            # yet, and locking position=0 now will conflict when the constraint resolves later.
+            if isinstance(c, PositionConstraint):
+                for c_axis in c.axes:
+                    if c_axis != axis:
+                        continue
+                    other_b0, other_b1 = slice_dict[c.other_object][axis]
+                    if other_b0 is None or other_b1 is None:
+                        if (c.object, 0) in extension_obj:
+                            extension_obj.remove((c.object, 0))
+                        if (c.object, 1) in extension_obj:
+                            extension_obj.remove((c.object, 1))
 
         # For each object, determine what can be extended
         for o in object_map.keys():

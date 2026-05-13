@@ -1,3 +1,14 @@
+import sys
+import warnings
+
+if sys.version_info >= (3, 14):
+    warnings.warn(
+        "Python 3.14+ is not supported by fdtdx. Expect crashes and unknown errors. "
+        "Support for Python 3.14 will be added in the coming months.",
+        UserWarning,
+        stacklevel=2,
+    )
+
 from fdtdx import constants
 from fdtdx.colors import Color
 from fdtdx.config import GradientConfig, SimulationConfig
@@ -33,7 +44,7 @@ from fdtdx.dispersion import (
     compute_pole_coefficients,
 )
 from fdtdx.fdtd.backward import full_backward
-from fdtdx.fdtd.container import ArrayContainer, ObjectContainer, ParameterContainer, SimulationState
+from fdtdx.fdtd.container import ArrayContainer, FieldState, ObjectContainer, ParameterContainer, SimulationState
 from fdtdx.fdtd.initialization import apply_params, place_objects, resolve_object_constraints
 from fdtdx.fdtd.wrapper import run_fdtd
 from fdtdx.interfaces.modules import DtypeConversion
@@ -92,7 +103,12 @@ from fdtdx.objects.object import (
 from fdtdx.objects.sources.dipole import PointDipoleSource
 from fdtdx.objects.sources.linear_polarization import GaussianPlaneSource, UniformPlaneSource
 from fdtdx.objects.sources.mode import ModePlaneSource
-from fdtdx.objects.sources.profile import GaussianPulseProfile, SingleFrequencyProfile
+from fdtdx.objects.sources.profile import (
+    CustomTimeSignalProfile,
+    GaussianPulseProfile,
+    SingleFrequencyProfile,
+    TemporalProfile,
+)
 from fdtdx.objects.static_material.cylinder import Cylinder
 from fdtdx.objects.static_material.polygon import (
     ExtrudedPolygon,
@@ -132,137 +148,134 @@ from fdtdx.optimization import (
     smooth_dilation,
     smooth_erosion,
 )
+from fdtdx.utils.extend_pml import extend_material_to_pml
 from fdtdx.utils.logger import Logger
 from fdtdx.utils.plot_field_slice import plot_field_slice, plot_field_slice_component
 from fdtdx.utils.plot_material import plot_material, plot_material_from_side
 from fdtdx.utils.plot_setup import plot_setup, plot_setup_from_side
+from fdtdx.utils.sparams import PortSpec, calculate_sparam, calculate_sparams, setup_sparams_simulation
 
 # PeriodicBoundary is now an alias for BlochBoundary with bloch_vector=(0,0,0)
 PeriodicBoundary = BlochBoundary
 
 __all__ = [
-    "Detector",
-    # conversion
-    "export_stl",
-    "export_json",
-    "export_json_str",
-    "import_from_json",
-    "export_vti",
-    "export_arrays_snapshot_to_vti",
-    # core
-    "TreeClass",
-    "autoinit",
-    "field",
-    "private_field",
-    "frozen_field",
-    "frozen_private_field",
-    "metric_efficiency",
-    "compute_energy",
-    "normalize_by_energy",
-    "compute_poynting_flux",
-    "normalize_by_poynting_flux",
-    "OnOffSwitch",
-    "WaveCharacter",
-    "compute_mode",
-    # fdtd
-    "run_fdtd",
-    "place_objects",
-    "apply_params",
-    "full_backward",
     "ArrayContainer",
-    "ParameterContainer",
-    "ObjectContainer",
-    "SimulationState",
-    "resolve_object_constraints",
-    # interfaces
-    "Recorder",
-    "RecordingState",
-    "DtypeConversion",
-    "LinearReconstructEveryK",
-    # objects:
-    "SimulationObject",
-    "PositionConstraint",
-    "RealCoordinateConstraint",
-    "SizeConstraint",
-    "SizeExtensionConstraint",
-    "GridCoordinateConstraint",
-    # boundaries
-    "PerfectElectricConductor",
-    "PerfectlyMatchedLayer",
-    "PerfectMagneticConductor",
-    "PeriodicBoundary",
+    "BinaryMedianFilterModule",
     "BlochBoundary",
     "BoundaryConfig",
-    "boundary_objects_from_config",
-    # detector
-    "DetectorState",
-    "EnergyDetector",
-    "PoyntingFluxDetector",
-    "FieldDetector",
-    "PhasorDetector",
-    "ModeOverlapDetector",
-    # device
-    "Device",
-    "StandardToInversePermittivityRange",
-    "StandardToCustomRange",
-    "StandardToPlusOneMinusOneRange",
-    "GaussianSmoothing2D",
-    "RemoveFloatingMaterial",
-    "ConnectHolesAndStructures",
-    "BinaryMedianFilterModule",
-    "ClosestIndex",
     "BrushConstraint2D",
-    "PillarDiscretization",
-    "TanhProjection",
-    "SubpixelSmoothedProjection",
+    "ClosestIndex",
+    "Color",
+    "ConnectHolesAndStructures",
+    "CustomTimeSignalProfile",
+    "Cylinder",
+    "Detector",
+    "DetectorState",
+    "Device",
     "DiagonalSymmetry2D",
     "DiagonalSymmetry3D",
+    "DispersionModel",
+    "DrudePole",
+    "DtypeConversion",
+    "EnergyDetector",
+    "ExtrudedPolygon",
+    "FieldDetector",
+    "FieldState",
+    "GaussianPlaneSource",
+    "GaussianPulseProfile",
+    "GaussianSmoothing2D",
+    "GradientConfig",
+    "GridCoordinateConstraint",
     "HorizontalSymmetry2D",
     "HorizontalSymmetry3D",
-    "VerticalSymmetry2D",
-    "VerticalSymmetry3D",
+    "LinearReconstructEveryK",
+    "Logger",
+    "LorentzPole",
+    "Material",
+    "ModeOverlapDetector",
+    "ModePlaneSource",
+    "ObjectContainer",
+    "OnOffSwitch",
+    "ParameterContainer",
+    "ParameterTransformation",
+    "PerfectElectricConductor",
+    "PerfectMagneticConductor",
+    "PerfectlyMatchedLayer",
+    "PeriodicBoundary",
+    "PhasorDetector",
+    "PillarDiscretization",
+    "PointDipoleSource",
     "PointSymmetry2D",
     "PointSymmetry3D",
-    "ParameterTransformation",
-    "circular_brush",
-    # sources
-    "PointDipoleSource",
-    "GaussianPlaneSource",
-    "UniformPlaneSource",
-    "ModePlaneSource",
-    "SingleFrequencyProfile",
-    "GaussianPulseProfile",
-    # static material
-    "Cylinder",
-    "Sphere",
-    "ExtrudedPolygon",
-    "extruded_polygon_from_gds",
-    "extruded_polygon_from_gds_path",
-    "UniformMaterialObject",
-    "SimulationVolume",
-    # utils
-    "Logger",
-    "plot_setup",
-    "plot_setup_from_side",
-    "plot_material_from_side",
-    "plot_material",
-    "plot_field_slice_component",
-    "plot_field_slice",
-    # config
-    "SimulationConfig",
-    "GradientConfig",
-    # other
-    "wavelength_to_period",
-    "Material",
-    "DispersionModel",
     "Pole",
-    "LorentzPole",
-    "DrudePole",
-    "compute_pole_coefficients",
+    "PortSpec",
+    "PositionConstraint",
+    "PoyntingFluxDetector",
+    "RealCoordinateConstraint",
+    "Recorder",
+    "RecordingState",
+    "RemoveFloatingMaterial",
+    "SimulationConfig",
+    "SimulationObject",
+    "SimulationState",
+    "SimulationVolume",
+    "SingleFrequencyProfile",
+    "SizeConstraint",
+    "SizeExtensionConstraint",
+    "Sphere",
+    "StandardToCustomRange",
+    "StandardToInversePermittivityRange",
+    "StandardToPlusOneMinusOneRange",
+    "SubpixelSmoothedProjection",
+    "TanhProjection",
+    "TemporalProfile",
+    "TreeClass",
+    "UniformMaterialObject",
+    "UniformPlaneSource",
+    "VerticalSymmetry2D",
+    "VerticalSymmetry3D",
+    "WaveCharacter",
+    "apply_params",
+    "autoinit",
+    "boundary_objects_from_config",
+    "calculate_sparam",
+    "calculate_sparams",
+    "circular_brush",
+    "compute_energy",
     "compute_eps_spectrum_from_coefficients",
     "compute_impedance_corrected_temporal_profile",
-    "Color",
+    "compute_mode",
+    "compute_pole_coefficients",
+    "compute_poynting_flux",
     "constants",
+    "export_arrays_snapshot_to_vti",
+    "export_json",
+    "export_json_str",
+    "export_stl",
+    "export_vti",
+    "extend_material_to_pml",
+    "extruded_polygon_from_gds",
+    "extruded_polygon_from_gds_path",
+    "field",
+    "frozen_field",
+    "frozen_private_field",
+    "full_backward",
+    "import_from_json",
+    "metric_efficiency",
+    "normalize_by_energy",
+    "normalize_by_poynting_flux",
+    "place_objects",
+    "plot_field_slice",
+    "plot_field_slice_component",
+    "plot_material",
+    "plot_material_from_side",
+    "plot_setup",
+    "plot_setup_from_side",
+    "private_field",
+    "resolve_object_constraints",
+    "run_fdtd",
+    "setup_sparams_simulation",
+    "wavelength_to_period",
     # optimization suite
     "Optimization",
     "LossTerm",

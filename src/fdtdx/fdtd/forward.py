@@ -1,7 +1,7 @@
 import jax
 
 from fdtdx.config import SimulationConfig
-from fdtdx.fdtd.container import ArrayContainer, ObjectContainer, SimulationState
+from fdtdx.fdtd.container import ArrayContainer, FieldState, ObjectContainer, SimulationState
 from fdtdx.fdtd.update import collect_interfaces, update_detector_states, update_E, update_H
 from fdtdx.interfaces.state import RecordingState
 from fdtdx.objects.detectors.detector import DetectorState
@@ -20,19 +20,20 @@ def forward_single_args_wrapper(
     inv_permeabilities: jax.Array,
     dispersive_P_curr: jax.Array | None,
     dispersive_P_prev: jax.Array | None,
+    dispersive_c1: jax.Array | None,
+    dispersive_c2: jax.Array | None,
+    dispersive_c3: jax.Array | None,
     detector_states: dict[str, DetectorState],
     recording_state: RecordingState | None,
-    dispersive_c1: jax.Array | None = None,
-    dispersive_c2: jax.Array | None = None,
-    dispersive_c3: jax.Array | None = None,
-    *,
     config: SimulationConfig,
     objects: ObjectContainer,
     key: jax.Array,
     record_detectors: bool,
     record_boundaries: bool,
     simulate_boundaries: bool,
-    arrays_template: ArrayContainer | None = None,
+    electric_conductivity: jax.Array | None = None,
+    magnetic_conductivity: jax.Array | None = None,
+    dispersive_inv_c2: jax.Array | None = None,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -46,32 +47,18 @@ def forward_single_args_wrapper(
     jax.Array | float,
     jax.Array | None,
     jax.Array | None,
+    jax.Array | None,
+    jax.Array | None,
+    jax.Array | None,
     dict[str, DetectorState],
     RecordingState | None,
 ]:
-    # ``arrays_template`` carries non-differentiated fields (electric/magnetic
-    # conductivity) that are closure-captured from the outer simulation state.
-    # The dispersive coefficient arrays (c1, c2, c3) may be passed either as
-    # primal positional arguments (so the outer ``jax.vjp`` treats them as
-    # differentiable primals — this is the code path enabled by
-    # ``GradientConfig.differentiate_dispersion=True``) or left as ``None`` to
-    # fall back to the template (non-differentiated closure capture).
-    if arrays_template is None:
-        electric_conductivity = None
-        magnetic_conductivity = None
-    else:
-        electric_conductivity = arrays_template.electric_conductivity
-        magnetic_conductivity = arrays_template.magnetic_conductivity
-
-    if dispersive_c1 is None and arrays_template is not None:
-        dispersive_c1 = arrays_template.dispersive_c1
-        dispersive_c2 = arrays_template.dispersive_c2
-        dispersive_c3 = arrays_template.dispersive_c3
+    # Wrapper function that unpacks ArrayContainer into individual arrays for JAX transformations.
+    # ``electric_conductivity``, ``magnetic_conductivity`` and ``dispersive_inv_c2`` are
+    # passed as defaulted kwargs so callers can closure-capture them via ``functools.partial``
+    # without exposing them as VJP primals.
     arr = ArrayContainer(
-        E=E,
-        H=H,
-        psi_E=psi_E,
-        psi_H=psi_H,
+        fields=FieldState(E=E, H=H, psi_E=psi_E, psi_H=psi_H),
         alpha=alpha,
         kappa=kappa,
         sigma=sigma,
@@ -86,6 +73,7 @@ def forward_single_args_wrapper(
         dispersive_c1=dispersive_c1,
         dispersive_c2=dispersive_c2,
         dispersive_c3=dispersive_c3,
+        dispersive_inv_c2=dispersive_inv_c2,
     )
     state = forward(
         state=(time_step, arr),
@@ -98,10 +86,10 @@ def forward_single_args_wrapper(
     )
     return (
         state[0],
-        state[1].E,
-        state[1].H,
-        state[1].psi_E,
-        state[1].psi_H,
+        state[1].fields.E,
+        state[1].fields.H,
+        state[1].fields.psi_E,
+        state[1].fields.psi_H,
         state[1].alpha,
         state[1].kappa,
         state[1].sigma,
@@ -109,6 +97,9 @@ def forward_single_args_wrapper(
         state[1].inv_permeabilities,
         state[1].dispersive_P_curr,
         state[1].dispersive_P_prev,
+        state[1].dispersive_c1,
+        state[1].dispersive_c2,
+        state[1].dispersive_c3,
         state[1].detector_states,
         state[1].recording_state,
     )
@@ -149,7 +140,7 @@ def forward(
         SimulationState: Updated simulation state for the next time step
     """
     time_step, arrays = state
-    H_prev = arrays.H
+    H_prev = arrays.fields.H
     arrays = update_E(
         time_step=time_step,
         arrays=arrays,

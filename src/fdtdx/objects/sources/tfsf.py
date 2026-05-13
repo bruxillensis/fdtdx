@@ -238,7 +238,7 @@ class TFSFPlaneSource(DirectionalPlaneSourceBase, ABC):
 
         center = jnp.asarray(
             [center_horizontal + horizontal_offset, center_vertical + vertical_offset],
-            dtype=jnp.float32,
+            dtype=self._config.dtype,
         ).squeeze()
         return center
 
@@ -257,7 +257,6 @@ class TFSFPlaneSource(DirectionalPlaneSourceBase, ABC):
         key: jax.Array,
         inv_permittivities: jax.Array,
         inv_permeabilities: jax.Array | float,
-        *,
         dispersive_c1: jax.Array | None = None,
         dispersive_c2: jax.Array | None = None,
         dispersive_c3: jax.Array | None = None,
