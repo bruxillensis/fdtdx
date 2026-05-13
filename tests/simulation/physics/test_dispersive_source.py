@@ -206,14 +206,21 @@ def test_broadband_correction_reduces_backward_reflection():
     bwd_corrected = _total_unsigned_flux(arrays_corrected, "flux_bwd")
     bwd_uncorrected = _total_unsigned_flux(arrays_uncorrected, "flux_bwd")
     fwd_corrected = _total_unsigned_flux(arrays_corrected, "flux_fwd")
+    fwd_uncorrected = _total_unsigned_flux(arrays_uncorrected, "flux_fwd")
 
     assert fwd_corrected > 0.0, "Corrected run produced no forward flux"
+    assert fwd_uncorrected > 0.0, "Uncorrected run produced no forward flux"
     assert bwd_uncorrected > 0.0, "Reference (uncorrected) run produced no backward flux"
 
-    ratio = bwd_corrected / bwd_uncorrected
+    # Compare normalized leakage (bwd/fwd) so the assertion stays meaningful
+    # even when the two runs happen to inject different total energies.
+    leakage_corrected = bwd_corrected / fwd_corrected
+    leakage_uncorrected = bwd_uncorrected / fwd_uncorrected
+    ratio = leakage_corrected / leakage_uncorrected
     assert ratio < 0.85, (
-        f"Broadband correction did not reduce backward reflection: "
-        f"corrected={bwd_corrected:.4e}, uncorrected={bwd_uncorrected:.4e}, "
+        f"Broadband correction did not reduce normalized backward leakage: "
+        f"leakage_corrected={leakage_corrected:.4e}, "
+        f"leakage_uncorrected={leakage_uncorrected:.4e}, "
         f"ratio={ratio:.3f} (expected < 0.85)"
     )
 

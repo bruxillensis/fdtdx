@@ -239,9 +239,16 @@ def compute_pole_coefficients(
     c2 = np.zeros(n, dtype=np.float64)
     c3 = np.zeros(n, dtype=np.float64)
     for i, p in enumerate(poles):
-        denom = 1.0 + 0.5 * p.gamma * dt
+        gamma_dt = p.gamma * dt
+        if gamma_dt >= 2.0:
+            raise ValueError(
+                f"Pole {i} ({type(p).__name__}) has gamma * dt = {gamma_dt:.4g} >= 2; "
+                "the reversible ADE update requires gamma * dt < 2 (physically gamma * dt << 1). "
+                "Lower the damping or reduce the time step."
+            )
+        denom = 1.0 + 0.5 * gamma_dt
         c1[i] = (2.0 - (p.omega_0**2) * (dt**2)) / denom
-        c2[i] = -(1.0 - 0.5 * p.gamma * dt) / denom
+        c2[i] = -(1.0 - 0.5 * gamma_dt) / denom
         c3[i] = (p.coupling_sq * dt**2) / denom
     return c1, c2, c3
 

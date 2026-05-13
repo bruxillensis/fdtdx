@@ -23,6 +23,7 @@ def _build_dispersive_H_filter(
     c2_slice: jax.Array,
     c3_slice: jax.Array,
     inv_eps_inf_slice: jax.Array,
+    dtype: jnp.dtype = jnp.float32,
 ) -> jax.Array:
     """Precompute the broadband-corrected H-side temporal profile for a TFSF source.
 
@@ -50,9 +51,12 @@ def _build_dispersive_H_filter(
         c3_slice: ADE coefficient array sliced to the source cells.
         inv_eps_inf_slice: Raw ``1/ε∞`` at the source cells
             (before any carrier-frequency correction).
+        dtype: Output dtype for the filtered profile. Should match the
+            simulation's field dtype so float64 simulations are not
+            silently downcast to float32. Defaults to float32.
 
     Returns:
-        JAX float32 array of shape ``(num_time_steps,)`` — the filtered
+        JAX array of shape ``(num_time_steps,)`` in ``dtype`` — the filtered
         temporal profile ``s_H[n]``.
     """
     carrier_period = wave_character.get_period()
@@ -106,7 +110,7 @@ def _build_dispersive_H_filter(
         eps_spectrum=eps_spectrum,
         eps_center=eps_center,
     )
-    return jnp.asarray(s_H, dtype=jnp.float32)
+    return jnp.asarray(s_H, dtype=dtype)
 
 
 @autoinit

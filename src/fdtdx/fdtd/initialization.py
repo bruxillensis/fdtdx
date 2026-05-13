@@ -181,8 +181,14 @@ def apply_params(
             # Fully anisotropic: reshape to 3x3 matrix, invert, and flatten back to 9 elements
             inv_allowed = jnp.array([jnp.linalg.inv(perm.reshape(3, 3)).flatten() for perm in allowed_perm_array])
 
-        device_is_dispersive = num_dispersive_poles > 0 and any(m.is_dispersive for m in device.materials.values())
-        if device_is_dispersive:
+        # When any object in the sim is dispersive (num_dispersive_poles > 0) we
+        # always write the coefficient stack into the device's grid_slice — even
+        # when none of the device's materials are dispersive themselves. Otherwise
+        # stale coefficients from an underlying dispersive region would survive
+        # and keep evolving polarization in the device's voxels.
+        # compute_allowed_dispersive_coefficients zero-pads non-dispersive materials.
+        write_dispersive = num_dispersive_poles > 0
+        if write_dispersive:
             assert (
                 arrays.dispersive_c1 is not None
                 and arrays.dispersive_c2 is not None
@@ -204,7 +210,7 @@ def apply_params(
             inv_allowed_bc = inv_allowed[:, :, None, None, None]
             # cur_material_indices: (*grid_shape) broadcasts with (num_components, 1, 1, 1)
             new_perm_slice = (1 - cur_material_indices) * inv_allowed_bc[0] + cur_material_indices * inv_allowed_bc[1]
-            if device_is_dispersive:
+            if write_dispersive:
                 # Linear interpolation of dispersive coefficients between the two bracketing materials.
                 # Note: this follows the same straight-through-estimator convention as the
                 # permittivity path above — it is *not* equivalent to a material whose
@@ -230,7 +236,7 @@ def apply_params(
             component_values = jnp.moveaxis(inv_allowed[cur_material_indices.astype(jnp.int32)], -1, 0)
             component_values = straight_through_estimator(cur_material_indices, component_values)
             new_perm_slice = component_values
-            if device_is_dispersive:
+            if write_dispersive:
                 int_idx = cur_material_indices.astype(jnp.int32)
                 # allowed_cN_arr[int_idx]: (Nx, Ny, Nz, num_poles) -> moveaxis -> (num_poles, Nx, Ny, Nz)
                 new_c1_slice = jnp.moveaxis(allowed_c1_arr[int_idx], -1, 0)[:, None, ...]
@@ -241,7 +247,7 @@ def apply_params(
         new_perm = arrays.inv_permittivities.at[:, *device.grid_slice].set(new_perm_slice)
         arrays = arrays.at["inv_permittivities"].set(new_perm)
 
-        if device_is_dispersive:
+        if write_dispersive:
             assert (
                 arrays.dispersive_c1 is not None
                 and arrays.dispersive_c2 is not None
@@ -705,7 +711,11 @@ def _init_arrays(
                 diff = component_values - magnetic_conductivity[:, *o.grid_slice]
                 magnetic_conductivity = magnetic_conductivity.at[:, *o.grid_slice].add(mask * diff)
 
-            if num_dispersive_poles > 0 and any(m.is_dispersive for m in o.materials.values()):
+            # Always run when dispersive arrays exist in the sim: a non-dispersive
+            # StaticMultiMaterialObject layered over a dispersive region must
+            # zero the inherited coefficients in its mask. compute_allowed_dispersive_coefficients
+            # zero-pads non-dispersive materials, so this still cleanly overwrites.
+            if num_dispersive_poles > 0:
                 assert dispersive_c1 is not None and dispersive_c2 is not None and dispersive_c3 is not None
                 allowed_c1, allowed_c2, allowed_c3 = compute_allowed_dispersive_coefficients(
                     o.materials,

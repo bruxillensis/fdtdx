@@ -200,8 +200,14 @@ class LinearlyPolarizedPlaneSource(TFSFPlaneSource, ABC):
                 c2_slice=c2_slice,
                 c3_slice=c3_slice,
                 inv_eps_inf_slice=inv_eps_inf_slice,
+                dtype=self._config.dtype,
             )
             self = self.aset("_temporal_H_filter", filtered, create_new_ok=True)
+        else:
+            # Reused source applied in a non-dispersive context: clear any stale
+            # H-side filter left over from a previous dispersive apply, otherwise
+            # the TFSF inner loop would keep injecting filtered amplitudes.
+            self = self.aset("_temporal_H_filter", None, create_new_ok=True)
 
         return self
 

@@ -139,8 +139,13 @@ class ModePlaneSource(TFSFPlaneSource):
                 c2_slice=c2_slice,
                 c3_slice=c3_slice,
                 inv_eps_inf_slice=inv_eps_inf_slice,
+                dtype=self._config.dtype,
             )
             self = self.aset("_temporal_H_filter", filtered, create_new_ok=True)
+        else:
+            # Reused source applied in a non-dispersive context: clear any stale
+            # filter from a previous dispersive apply.
+            self = self.aset("_temporal_H_filter", None, create_new_ok=True)
 
         return self
 
