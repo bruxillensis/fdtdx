@@ -319,6 +319,134 @@ All state arrays have a leading time dimension: `(num_time_steps_on, ...)`. Use 
 
 **ModeOverlapDetector** — inherits PhasorDetector, always uses all 6 field components. Use `compute_overlap_to_mode()` to get the scalar overlap. In a dispersive medium, the reference mode is solved against `effective_inv_permittivity` at the detector's carrier frequency (same correction as `ModePlaneSource`), so the overlap compares against ε(ω_c) rather than ε∞.
 
+## Optimization Suite
+
+`fdtdx.optimization` (re-exported from `fdtdx`) is the inverse-design driver. Three core abstractions:
+
+- **`LossTerm`** — a `TreeClass` contributing `sign * schedule(epoch) * raw` to the loss. `compute(*, params, objects, arrays, config, epoch) → (scalar, info_dict)`. `__call__` wraps the raw metric with the schedule and auto-injects `{name}_raw`, `{name}_weight`, `{name}_contrib` into the info dict.
+- **`Objective`** (subclass of LossTerm) — driver calls with `sign=-1`. Use for quantities to MAXIMISE (efficiency, overlap).
+- **`Constraint`** (subclass of LossTerm) — driver calls with `sign=+1`. Use for penalties to MINIMISE (fab violations, reflections).
+
+Every term takes `name: str` (frozen, used as info-dict prefix) and `schedule: WeightSchedule` (default `ConstantSchedule(value=1.0)`).
+
+### Weight Schedules (`fdtdx.optimization.schedules`)
+
+All JIT-safe (no Python branching on traced epoch). Shared fields: `epoch_start` (default 0), `epoch_end` (default `None` = unbounded). Returns `0.0` outside `[epoch_start, epoch_end]`.
+
+- **`ConstantSchedule(value=1.0)`** — constant inside window.
+- **`LinearSchedule(start_value=0.0, end_value=1.0)`** — linear ramp.
+- **`ExponentialSchedule(start_value=1e-3, end_value=1.0)`** — log-linear; both bounds must be > 0.
+- **`CosineSchedule(start_value=0.0, end_value=1.0)`** — cosine-eased with zero derivative at endpoints.
+- **`OnOffSchedule(value=1.0)`** — binary on/off (semantically == Constant, documents hard-switch intent).
+
+**Default fab-rule / connectivity constraints to a ramp AND delay the ramp start until β has hardened** — not `epoch_start=0`. DRC ("feature thinner than X") and connectivity ("is it one piece") are *meaningless on the initial gray ρ≈0.5 field* and, applied from epoch 0, dominate the gradient so the optimizer never finds a guiding/physics-satisfying structure. Use e.g. `LinearSchedule(epoch_start=round(0.4*epochs), epoch_end=round(0.95*epochs), start_value=0.0, end_value=1.0)` so they switch on only after the projection β ramp has substantially binarized the design. Physics objectives/constraints (flux, overlap, phase, back-reflection) stay `ConstantSchedule` from epoch 0. Always sanity-check each term's raw magnitude in `metrics.csv` (`{name}_raw`) and size `end_value` so its `{name}_contrib` is comparable to the primary objective — a term whose raw is orders of magnitude larger silently becomes the only thing optimized.
+
+### Wrappers for One-Off Terms
+
+- **`FunctionObjective(name=..., schedule=..., fn=callable)`** — wraps a user callable `fn(*, params, objects, arrays, config, epoch) → (scalar, info_dict)`. No subclassing needed.
+- **`FunctionConstraint(...)`** — same, contributes with `sign=+1`.
+
+### Built-In Manufacturing Constraints
+
+All evaluate the device density via the shared helper `_eval_device_density(device, params[name])` (in `constraints/physics.py`), which calls `device(leaf, beta=_HARDEN_BETA)` (`_HARDEN_BETA = 50.0`) and falls back to a no-kwarg call on `TypeError`. This is required because a device whose param pipeline contains a β-projection (`TanhProjection`, `SubpixelSmoothedProjection`) raises if called without `beta` — so DRC/connectivity/OPC constraints (and the `Optimization` driver's `logger.log_params`) all evaluate the *as-fabricated* near-binary design at a hardened β, not the soft latent. They use morphology primitives from `fdtdx.optimization.utils.morphology`; device's `single_voxel_real_shape[0]` gives the XY pitch used to translate meters → odd voxel kernel.
+
+- **`MinLineSpace(device_name, min_line_width_m, min_space_m, beta=8.0, eta_erode=0.75, eta_dilate=0.25)`** — Sigmund-Wang filter-and-project. Penalises solid features thinner than `min_line_width_m` and gaps narrower than `min_space_m`: `mean(thin_line²) + mean(thin_gap²)`. Info keys: `thin_line`, `thin_gap`.
+- **`MinInclusion(inner_device_name, outer_device_name, min_margin_m, beta=8.0, eta=0.75)`** — inner device must lie inside outer device eroded by `min_margin_m`. Last 2 axes (XY) must match; Z broadcasts. Info: `max_violation`, `mean_violation`.
+- **`NoFloatingMaterial(device_stack_names: tuple[str, ...])`** — for a bottom→top stack of etched layers, penalises `mean(ReLU(ρ_above - ρ_below)²)` summed over adjacent pairs. All layers must share shape. Info: `max_excess`, `penalty`. Use this for multi-etch-level devices where upper layers need support below.
+
+### Connectivity
+
+- **`VirtualTemperatureConnectivity(device_name, source_mask, drain_mask, kappa_min=1e-3, kappa_max=1.0, p=3.0, cg_iterations=200, cg_tol=1e-6)`** — solves `-∇·(κ(ρ) ∇T) = source_mask` with `T=0` on `drain_mask` via CG with Jacobi preconditioner. `κ(ρ) = κ_min + (κ_max-κ_min)·ρᵖ` (SIMP). Masks must match `device.ndim` or be 2D/3D (stencil auto-selected). The penalty is the mean source-cell temperature **normalized by the fully-disconnected baseline** (the same solve with κ ≡ κ_min, which is ρ-independent → solved once internally and `stop_gradient`'d). So the raw penalty is intrinsically **~[0,1]**: ≈1 fully disconnected, →0 once ρ forms a continuous source→drain path. Use a normal **O(1) weight** (no tiny magic scale). Info keys: `{name}_penalty_norm` (the returned scalar), `{name}_disconnect_ref`, `{name}_temp_mean_source`, `{name}_temp_max`. (Pre-normalization the raw was an un-normalized ~1e3–1e4 mean temperature that silently dominated the loss — don't reintroduce a hand-tuned weight to compensate.)
+
+### Lithography / OPC
+
+- **`LithographyModel(wavelength_m=193e-9, numerical_aperture=0.85, sigma_inner=0.0, sigma_outer=0.7, sigma_transition=0.0, resist_threshold=0.3, resist_sharpness=50.0, num_kernels=20, source_grid_points=41)`** — Hopkins partially-coherent imaging with SOCS compression (top-K eigenpairs of the TCC) + sigmoid resist. Two-stage life cycle:
+  1. Config-only until `.prepare(grid_shape, voxel_pitch_m)` → new model with frozen kernel/eigenvalue leaves. Eigendecomposition runs on numpy at prepare time; fails if voxel pitch is too coarse for NA/λ.
+  2. Prepared model supplies `aerial_image(design) → intensity` and `forward(design) → (printed, aerial)` (printed = sigmoid(sharpness·(aerial - threshold))). Broadcasts over leading axes; last 2 axes are spatial.
+- **`OPCConstraint(device_name, litho_model, target_design=None)`** — `mean((printed - target)²)` where target is `ρ` itself (self-consistency) when `target_design is None`, else the supplied array. Use `OPCConstraint.for_device(device, litho_model, name=..., target_design=...)` to prepare the model on the device's XY grid automatically. Info: `aerial_max`, `aerial_mean`, `mismatch`.
+
+### Physics-Base for Custom Constraints
+
+- **`PhysicsConstraint`** (abstract) — fetches density via `device_name`, clips to `[0, 1]`, squeezes trailing singletons, hands `rho` to `build_penalty(rho) → (scalar, info)`. Extend for density-only constraints.
+- **`LinearSteadyStatePDEConstraint`** (abstract) — solves `A(ρ) u = b(ρ)` with implicit-diff CG (gradients flow through the CG solve via JAX's built-in VJP). Subclasses override `operator(u, rho)` (must be symmetric), `rhs(rho)`, `preconditioner_diag(rho) | None`, and `penalty(u, rho) → (scalar, info)`. Fields: `cg_iterations=200`, `cg_tol=1e-6`. `VirtualTemperatureConnectivity` is the reference example.
+
+### EOM Mechanical / Electrostatic Co-simulation (`fdtdx.optimization.mechanical`)
+
+Differentiable electro-opto-mechanical chain for MEMS-actuated photonics: solve electrostatics → Maxwell-stress body force → mechanical displacement → first-order shape-derivative permittivity perturbation → FDTD. All JAX-pure, gradients flow back to ρ. Call these *inside* `simulate_fn`, between `apply_params` and `run_fdtd`. Re-exported from `fdtdx`.
+
+- **`PoissonSolver(electrode_mask, ground_mask, eps_min=1.0, eps_max=11.7, cg_iterations=400, cg_tol=1e-6, voxel_size_m=None)`** — quasi-static `-∇·(ε(ρ)∇φ)=0` with Dirichlet **lifting** (φ = ψ + φ_D, solve homogeneous-Dirichlet ψ; required for CG SPD-consistency — a naive RHS makes φ overshoot ≫ V). `.solve(rho, voltage) → φ` (bounded by V). `.force_field(φ, rho) → (3,*grid)` body force `½ε₀ε|∇φ|²∇ρ` in **N/m³** — pass `voxel_size_m` so ∇φ is V/m and ∇χ is 1/m (without it the force is off by ~1/Δ³ and unusable). Works in 2-D or 3-D (ndim from `φ`). **Electrostatics gotchas:** (a) a MEMS actuator's moving element is a *conductor* — model Si with a large effective DC ε (~1e4), not 11.7, or the body force under-predicts the true Maxwell stress ~1000×; (b) lateral/in-plane actuation force is *entirely* a fringing-field effect — solve in full 3-D with air margins around the beam, a 2-D/uniform model collapses it to ~0.
+- **`MechanicalModel`** (abstract base) — `equilibrium_displacement(rho, force) → (3,*design_grid)`.
+- **`ElasticityEigenmodes(young_modulus, poisson_ratio=0.27, density, voxel_size_m, free_dof_mask, n_modes=1, n_subspace=None, p_stiffness=3.0, eps_stiffness_min=1e-3, eps_mass_min=1e-6, n_subspace_iter=8, cg_iterations=100, cg_tol=1e-5, initial_subspace=None, rho_mask_threshold=0.5)`** — recomputes the lowest modes of `K(ρ)u = ω²M(ρ)u` each call on the **Si subdomain** of ρ (matrix-free subspace iteration + CG inverse iteration + Rayleigh-Ritz). The operator is restricted at element level: only Q1 elements whose 8 corners all satisfy `ρ > rho_mask_threshold` contribute strain energy, so boundary "mixed" elements drop out and the Si surfaces are traction-free — the same mesh-only-the-solid physics COMSOL uses. Air-only nodes are pinned in the DOF mask so they don't appear as zero-eigenvalue rigid-body modes. The ρ-threshold comparison is `stop_gradient`; ρ-gradients reach the modes through SIMP-scaled Lamé / density on Si cells. Uses a **trilinear Q1 hex element with selective reduced integration** (deviatoric 2×2×2 Gauss, volumetric 1-point) — a node-collocated central-difference stencil locks ~250× too stiff for slender flexures. K/M are non-dimensionalized internally (else float32 underflows). Requires ≥ 2 cells per axis (1-cell-thick optical layers must be z-replicated to ~4 cells; thin Si features need ≥ 2 cells across them, else no fully-Si elements exist along that axis). `initial_subspace=None` (default) runs cold on the real structure with a deterministic structured basis; optionally warm-start from `doubly_clamped_beam_modes(...)["mode_shapes"]` if you know the geometry is beam-like. `compute_modes(rho) → (eigvals (rad/s)², mode_shapes M-orthonormal)`.
+- **`build_dof_mask(grid_shape, *, clamped_regions=(), symmetry_planes=())`** — bool `(3,Nx,Ny,Nz)`, True=free. `clamped_regions`: list of `(sx,sy,sz)` slice-triples pinning all 3 DOFs (anchors). `symmetry_planes`: `(axis, sx,sy,sz)` pinning the normal component only.
+- **`doubly_clamped_beam_modes(*, length_m, width_m, thickness_m, young_modulus, density, grid_shape, beam_axis=0, deflection_axis=2, n_modes=1)`** — analytical Euler-Bernoulli modes → dict with `mode_shapes`, `modal_stiffness`, `modal_mass`, `voxel_volume_m3`, `natural_frequencies_hz`. `deflection_axis=2` vertical, `=1` lateral/in-plane.
+- **`apply_displacement_to_permittivity(inv_permittivities_sim, displacement_design, grid_points_per_voxel, sim_grid_shape, sim_slice, voxel_size_m)`** — first-order `ε(x) → ε(x − u·∇ε)` (valid only for `|u| ≲` voxel pitch). Upsamples design-grid `u` to the sim Yee grid (zero outside the device `grid_slice`). Returns updated `inv_permittivities`; `.aset("inv_permittivities", …)` it onto the array container before `run_fdtd`. **A rigid translation of a vertically-symmetric waveguide is first-order phase-neutral** — use lateral actuation + an asymmetric (inverse-designed) ρ so `∂ε/∂y ≠ 0` across the mode.
+- **`pull_in_voltage(amplitudes_m, generalized_stiffness, generalized_force_per_v2) → (V_pi, V_branch)`** and **`pull_in_voltage_from_force_fn(k, force_per_v2_fn, max_amplitude_m, n_samples=48)`** — displacement-controlled limit-point continuation (see the pull-in pitfall). **`advect_density(field, displacement_voxels, order=1)`** — differentiable linear Eulerian rigid shift of a density field (finite-displacement counterpart of the first-order `apply_displacement_to_permittivity`).
+- Low-level operators (`fdtdx.optimization.mechanical.elasticity`): `stiffness_operator_3d(u, lame_mu, lame_lambda, voxel_size_m, free_mask)` = `jax.grad` of the Q1/SRI strain energy (symmetric by construction), `mass_operator_3d(u, density_field, voxel_size_m, free_mask)` lumped diagonal.
+
+**Pipeline gotchas:** (1) `simulate_fn`'s returned `ArrayContainer` must have the **same detector_states pytree every epoch** — if you run two FDTD passes (e.g. V_on/V_off) and merge with suffixed keys, pre-register the extra keys (zeros) in the initial `arrays` before constructing `Optimization`, or the driver's compiled `loss_fn` fails on the threaded-back input. (2) `config.time` must let light traverse the *whole* device (length / group-velocity) plus settling, or output detectors read a tiny perturbation-insensitive precursor. (3) `ModeOverlapDetector.compute_overlap` needs `.apply(...)` called once at setup to populate the reference mode (the driver passes pre-`apply` objects to metric callbacks); close the metric over a setup-prepared detector — fine since a fixed-geometry output-WG reference mode is deformation-invariant.
+
+**Pull-in-safe voltage range (don't hand-pick V_max).** Pull-in is a saddle-node bifurcation, so a voltage-stepped Newton/transient ramp is singular/expensive there. Use **displacement-controlled limit-point continuation** via `fdtdx.pull_in_voltage(amplitudes_m, k, f)` / `pull_in_voltage_from_force_fn(k, f_fn, max_amplitude_m)`: parametrize the branch by deflection `s`, `V²(s)=k·s/f(s)`, `V_pi = max_s √(k s/f(s))` (envelope-theorem differentiable — hard `max` over a dense `s` grid gives the design sensitivity without differentiating through the bifurcation). Two non-negotiables: (1) `f(s)` must be the **finite-gap** force (moving conductor actually translated to `s`), not the first-order `ε(x−u·∇ε)` perturbation (no gap-narrowing ⇒ no pull-in); (2) for a **conductor** moving element, get `f(s)` from the **capacitance/co-energy** `C(s) ∝ ∫|∇φ_s|² dV → f=½dC/ds` (a clean global integral), **not** the Maxwell body-force `½ε₀ε|∇φ|²∇ρ` at the moved interface — that term is interpolation noise at a smeared high-ε conductor edge (it oscillates sign). Translate the conductor as an **integer-cell shift of its Dirichlet mask** on a gap-refined grid (≥~20 cells across the gap; exact, no interpolation) — or `fdtdx.advect_density` (differentiable linear Eulerian shift) when a sub-voxel/differentiable move is needed. Calibrate the generalized stiffness `k = f(0)/peak0` where `peak0` is the peak deflection from one validated 3-D modal-elasticity linear solve at V=1 — then the small-`s` branch reproduces the real distributed solver and only the finite-gap `f(s)` is added. Detect a genuine **interior** maximum; if the branch is monotone the device is **contact-limited** (no bifurcation before the gap closes) — cap by a safe-travel (g/3) criterion instead. See `_compute_pull_in` / `_eom_branch` in `examples/optimize_phase_tuner.py`; recomputed every epoch from the current ρ (V_pi drifts with ρ → `V_on = 0.9 · V_pi`).
+
+### `Optimization` Driver
+
+```python
+opt = fdtdx.Optimization(
+    objects=objects,            # frozen_field — structural, not traced
+    arrays=arrays,              # frozen_field — initial state (JIT-donation-safe)
+    params=params,              # field — traced, primary gradient target
+    config=config,              # frozen_field
+    simulate_fn=simulate_fn,    # (params, arrays, objects, config, key, epoch) → arrays
+    optimizer=optax.adam(...),  # any optax.GradientTransformation
+    objectives=(...,),          # tuple of Objective
+    constraints=(...,),         # tuple of Constraint
+    total_epochs=500,
+    param_clip=(0.0, 1.0),      # applied after every optax update
+    logger=exp_logger,          # optional fdtdx.Logger
+    log_every=1,
+    checkpoint_every=50,
+    checkpoint_dir=None,        # defaults to {logger.cwd}/checkpoints
+)
+final = opt.run(key=key, seed_from=..., seed_iter=..., resume_from=...)
+```
+
+- `simulate_fn` is where you call `fdtdx.apply_params(..., beta=beta_schedule(epoch))` and `fdtdx.run_fdtd(...)`. The driver doesn't hard-code those — users control beta, custom backward passes, etc.
+- `loss_fn` (internal) is `jax.jit`-compiled with `donate_argnames=["arrays"]`; compilation happens once up front.
+- `seed_from` loads params only (resets optax state + epoch). `resume_from` restores params + optax state + epoch + RNG. They are mutually exclusive.
+- Returns a new `Optimization` with updated `params` and `arrays`.
+
+### Utils
+
+- **`fdtdx.build_arg_parser(description=...)`** → pre-populated `argparse.ArgumentParser` with `--seed-rng`, `--evaluation`, `--backward`, `--seed-from PATH`, `--seed-iter IDX|latest`, `--resume-from PATH`. Extend with script-specific flags before `parse_args()`.
+- **`fdtdx.save_checkpoint(dir, *, epoch, params, opt_state, rng_key)`** / **`load_checkpoint(path, *, params_template, opt_state_template, rng_key_template=None)`** — full resume; writes `checkpoint_{epoch:06d}.eqx` + `.json`. `load_checkpoint` accepts either a dir (auto-picks latest) or a direct `.eqx` file.
+- **`fdtdx.load_seed_params(seed_path, params_template, iter_idx=None)`** — reads `params_{iter}_{device}.npy` from a Logger output dir. Auto-selects the highest iter for which every device in `params_template` has a file. Values are replaced; shapes/dtypes must match the template.
+- **Morphology** (`fdtdx.optimization.utils.morphology`, also re-exported): `box_filter_2d`, `gaussian_filter_2d`, `smooth_erosion(rho, k, beta=8.0, eta=0.75)`, `smooth_dilation(rho, k, beta=8.0, eta=0.25)`, `meters_to_odd_kernel(length_m, voxel_pitch_m)` (clamps to ≥3, rounds up to odd). All morphology ops act on the last two axes and broadcast over leading batch axes.
+
+### Typical Script Flow
+
+```python
+parser = fdtdx.build_arg_parser()
+args = parser.parse_args()
+
+# ... construct objects, place_objects, define simulate_fn ...
+
+objectives = (
+    fdtdx.FunctionObjective(name="flux_eff", fn=flux_metric,
+                            schedule=fdtdx.ConstantSchedule(0.5)),
+    fdtdx.FunctionObjective(name="overlap", fn=overlap_metric,
+                            schedule=fdtdx.ConstantSchedule(0.5)),
+)
+constraints = (
+    fdtdx.MinLineSpace(name="ls", device_name="dev",
+                       min_line_width_m=140e-9, min_space_m=140e-9,
+                       schedule=fdtdx.LinearSchedule(
+                           epoch_start=0, epoch_end=round(0.9*epochs),
+                           start_value=0.0, end_value=1.0)),
+)
+
+opt = fdtdx.Optimization(..., objectives=objectives, constraints=constraints)
+final = opt.run(key=key, seed_from=args.seed_from, resume_from=args.resume_from)
+```
+
 ## Testing Patterns
 
 **Three test tiers** (auto-marked via conftest.py):
@@ -377,3 +505,13 @@ assert jnp.all(jnp.isfinite(grads))
 - **Dispersive pole count is max'd globally**: The `num_poles` leading axis size = `objects.max_num_dispersive_poles`. Adding one 3-pole material allocates 3 pole slots for every dispersive cell in the sim; non-dispersive cells still have their `c1/c2/c3` set to zero (ADE term vanishes) but consume array memory.
 - **Dispersive source impedance**: Inside a dispersive medium, never use ε∞ as the source's effective permittivity — call `effective_inv_permittivity` at ω_c. Broadband pulses additionally need the `_temporal_H_filter` path to avoid TFSF leakage at off-carrier frequencies.
 - **Stacking objects with mixed dispersion**: `UniformMaterialObject` always writes a full zero-padded pole-coefficient stack into its `grid_slice`, so placing a non-dispersive object over a dispersive one cleanly overwrites stale coefficients. Rely on this rather than assuming "no dispersion = leave coefficients alone".
+- **WeightSchedule is zero outside `[epoch_start, epoch_end]`** — not just capped. If you use `LinearSchedule` as a generic epoch→value utility (e.g. for beta projection), remember that `schedule(epoch)` returns `0.0` for `epoch > epoch_end`, not the `end_value`. For an unbounded hold past the ramp, leave `epoch_end=None`.
+- **Don't pass `fdtdx.apply_params` beta into `Optimization`** — the driver doesn't know about beta. Plumb beta through your `simulate_fn(params, arrays, objects, config, key, epoch)` callback: `arrays, objects, _ = fdtdx.apply_params(arrays, objects, params, key, beta=beta_schedule(epoch))`.
+- **`LithographyModel` must be `.prepare(...)`d before use** — an un-prepared model has `kernels=None`; calling `aerial_image`/`forward` will crash. Prefer `OPCConstraint.for_device(device, model, ...)` which prepares automatically on the device's XY grid.
+- **`Optimization.arrays` is `frozen_field`** — the initial reference stored on `self` is excluded from the pytree so JIT-donation inside `run()` doesn't break pytreeclass's copy-based `.aset` on the final return. Don't try to trace through `opt.arrays`; treat it as the initial state only.
+- **`seed_from` vs `resume_from`** are mutually exclusive. `seed_from` loads params only (optax state and epoch reset to 0); `resume_from` restores params + optax + epoch + RNG.
+- **Built-in constraints evaluate the device at a hardened β** (`_eval_device_density`, β=50): a device with a `TanhProjection`/`SubpixelSmoothedProjection` pipeline raises if called without `beta`. This is intentional (DRC/connectivity/OPC judge the as-fabricated near-binary design) — don't "fix" it by stripping the projection; if you add a new density-reading constraint, route through `_eval_device_density`, don't call `device(params[name])` directly.
+- **`simulate_fn` must return a structurally identical `ArrayContainer` every epoch** — the driver compiles `loss_fn` once and threads the output back as the next input. Multi-pass schemes that add suffixed `detector_states` keys must pre-seed those keys (zeros) into the initial `arrays` *before* building `Optimization`, else epoch 1 fails with a pytree mismatch.
+- **A rigid translation of a symmetric waveguide is first-order phase-neutral** — vertical MEMS deflection of a symmetric strip yields ~0 Δn_eff. Use lateral actuation with an asymmetric inverse-designed ρ; and model the moving Si as a *conductor* (large DC ε) with *3-D* electrostatics or the actuation force is under-predicted ~1000× / collapses to ~0. See the EOM Co-simulation section.
+- **`VirtualTemperatureConnectivity` penalty is normalized ~[0,1]** (by the disconnected baseline) — use an O(1) weight.
+- **`ElasticityEigenmodes` requires ≥ 2 cells per axis across every Si feature** — the operator is restricted to elements whose 8 corners are all Si, so a 1-cell-thick feature has no fully-Si elements along that axis and won't appear in the elastic body. For thin features, refine the mech grid (the optical Device's voxel pitch is independent of the mech grid — z-replicate the optical density to ≥ 2 mech cells per side).
