@@ -59,8 +59,24 @@ def save_checkpoint(
     }
     eqx_path = checkpoint_dir / f"checkpoint_{epoch:06d}.eqx"
     meta_path = checkpoint_dir / f"checkpoint_{epoch:06d}.json"
-    eqx.tree_serialise_leaves(str(eqx_path), state)
-    meta_path.write_text(json.dumps({"epoch": int(epoch)}))
+    try:
+        eqx.tree_serialise_leaves(str(eqx_path), state)
+    except Exception as exc:  # noqa: BLE001
+        # Some optax wrappers (e.g. ``optax.inject_hyperparams(nadam)``) wrap
+        # their moment state in pytrees equinox cannot traverse — typically
+        # bombs at ``opt_state.inner_state[0].mu.<device>`` with TreePathError.
+        # Fall back to a params-only checkpoint so warm-starts via
+        # ``--seed-from`` still work; the optimiser state is reconstructible
+        # by re-running the schedule from the saved epoch.
+        logger.warning(
+            f"Full checkpoint serialisation failed ({exc!r}); writing "
+            "params-only fallback at {eqx_path}"
+        )
+        params_only_state: dict[str, Any] = {"params": params, "rng_key": rng_key}
+        eqx.tree_serialise_leaves(str(eqx_path), params_only_state)
+        meta_path.write_text(json.dumps({"epoch": int(epoch), "params_only": True}))
+        return eqx_path
+    meta_path.write_text(json.dumps({"epoch": int(epoch), "params_only": False}))
     logger.info(f"Saved checkpoint at epoch {epoch} -> {eqx_path}")
     return eqx_path
 
@@ -101,9 +117,20 @@ def load_checkpoint(
         raise FileNotFoundError(f"Missing checkpoint metadata: {meta_path}")
     meta = json.loads(meta_path.read_text())
     epoch = int(meta["epoch"])
+    params_only = bool(meta.get("params_only", False))
 
     if rng_key_template is None:
         rng_key_template = jax.random.PRNGKey(0)
+    if params_only:
+        # Optimiser state was not serialisable; restore params + RNG only
+        # and let the caller re-initialise opt_state from the resumed params.
+        template_po: dict[str, Any] = {"params": params_template, "rng_key": rng_key_template}
+        state_po = eqx.tree_deserialise_leaves(str(eqx_path), template_po)
+        logger.info(
+            f"Loaded params-only checkpoint from {eqx_path} (epoch={epoch}); "
+            "optimiser state will be re-initialised by the caller."
+        )
+        return epoch, state_po["params"], opt_state_template, state_po["rng_key"]
     template: dict[str, Any] = {
         "params": params_template,
         "opt_state": opt_state_template,

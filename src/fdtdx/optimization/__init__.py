@@ -56,18 +56,11 @@ from fdtdx.optimization.constraints.physics import (
     LinearSteadyStatePDEConstraint,
     PhysicsConstraint,
 )
-from fdtdx.optimization.mechanical import (
-    ElasticityEigenmodes,
-    MechanicalModel,
-    PoissonSolver,
-    advect_density,
-    apply_displacement_to_permittivity,
-    apply_finite_displacement_to_permittivity,
-    build_dof_mask,
-    doubly_clamped_beam_modes,
-    pull_in_voltage,
-    pull_in_voltage_from_force_fn,
-)
+# Slow-physics solvers (ElasticityEigenmodes, PoissonSolver,
+# ElectroMechanicalFEM, pull_in_voltage, advect_density, …) have moved to
+# the sibling ``fdtdx-multiphysics`` package — install separately and
+# import from ``fdtdx_multiphysics`` in user code.  fdtdx itself stays
+# EM-only.
 from fdtdx.optimization.objectives.function import FunctionObjective
 from fdtdx.optimization.optimization import Optimization
 from fdtdx.optimization.schedules import (
@@ -101,7 +94,6 @@ __all__ = [
     "ConstantSchedule",
     "Constraint",
     "CosineSchedule",
-    "ElasticityEigenmodes",
     "ExponentialSchedule",
     "FunctionConstraint",
     "FunctionObjective",
@@ -109,7 +101,6 @@ __all__ = [
     "LinearSteadyStatePDEConstraint",
     "LithographyModel",
     "LossTerm",
-    "MechanicalModel",
     "MinInclusion",
     "MinLineSpace",
     "NoFloatingMaterial",
@@ -118,22 +109,14 @@ __all__ = [
     "OnOffSchedule",
     "Optimization",
     "PhysicsConstraint",
-    "PoissonSolver",
     "VirtualTemperatureConnectivity",
     "WeightSchedule",
-    "advect_density",
-    "apply_displacement_to_permittivity",
-    "apply_finite_displacement_to_permittivity",
     "box_filter_2d",
     "build_arg_parser",
-    "build_dof_mask",
-    "doubly_clamped_beam_modes",
     "gaussian_filter_2d",
     "load_checkpoint",
     "load_seed_params",
     "meters_to_odd_kernel",
-    "pull_in_voltage",
-    "pull_in_voltage_from_force_fn",
     "save_checkpoint",
     "smooth_dilation",
     "smooth_erosion",

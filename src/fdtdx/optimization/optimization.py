@@ -126,6 +126,16 @@ class Optimization(TreeClass):
     # kill a long optimization).  Typed ``Any`` to avoid pytree-izing.
     epoch_callback: Any = frozen_field(default=None)
 
+    # Optional hook called BEFORE each compiled() invocation, signature
+    # ``pre_step_hook(epoch=int, params=params, arrays=arrays,
+    # objects=self.objects, optimization=self) -> updated_arrays``.
+    # Use it to thread Python-side / out-of-trace computations (e.g. CPU
+    # FEM solves from fdtdx-multiphysics) into the JIT region by injecting
+    # results into ``arrays.detector_states``.  Returning ``None`` keeps
+    # arrays unchanged.  Exceptions are NOT caught — a broken pre-step is
+    # a hard error because it can desynchronise the gradient.
+    pre_step_hook: Any = frozen_field(default=None)
+
     # ------------------------------------------------------------------
     # Loss construction (pure, JIT-compatible)
     # ------------------------------------------------------------------
@@ -223,16 +233,19 @@ class Optimization(TreeClass):
 
         value_and_grad = jax.value_and_grad(self.loss_fn, has_aux=True)
         jit_step = jax.jit(value_and_grad, donate_argnames=["arrays"])
-        # Lower + compile once up front so the first epoch isn't penalised.
-        _log.info("Compiling loss_fn...")
+        # NB: the previous pre-compile step
+        #     ``compiled = jit_step.lower(...).compile()``
+        # triggered ``Computation compiled for X inputs but called with Y``
+        # on JAX ≥ 0.9 when ``self.loss_fn`` closure-captured the large
+        # ObjectContainer / ConfigContainer (each turning into many
+        # const_args at lower time that the runtime Compiled.call could
+        # not re-thread).  Letting ``jit_step`` lazy-compile on the first
+        # epoch is equivalent for steady-state cost — the only difference
+        # is that epoch 0 now bears the compile latency.
+        compiled = jit_step
         compile_start = time.time()
-        compiled = jit_step.lower(
-            params,
-            arrays,
-            key,
-            jnp.asarray(start_epoch, dtype=jnp.float32),
-        ).compile()
-        _log.info(f"Compilation finished in {time.time() - compile_start:.1f}s")
+        _log.info("Deferring loss_fn compile to first epoch call…")
+        _ = compile_start  # retained for downstream timing diagnostics
 
         progress_task = None
         if self.logger is not None:
@@ -245,6 +258,16 @@ class Optimization(TreeClass):
             run_start = time.time()
             key, subkey = jax.random.split(key)
             epoch_arr = jnp.asarray(epoch, dtype=jnp.float32)
+            if self.pre_step_hook is not None:
+                updated = self.pre_step_hook(
+                    epoch=epoch,
+                    params=params,
+                    arrays=arrays,
+                    objects=self.objects,
+                    optimization=self,
+                )
+                if updated is not None:
+                    arrays = updated
             (loss, (arrays, info)), grads = compiled(params, arrays, subkey, epoch_arr)
 
             updates, opt_state = self.optimizer.update(grads, opt_state, params)
@@ -267,6 +290,9 @@ class Optimization(TreeClass):
                 # Devices whose parameter pipeline contains a β-projection
                 # (Tanh / SubpixelSmoothed) require ``beta`` as a call kwarg;
                 # fall back to no-kwarg for pipelines that reject it.
+                # Logger.log_params itself handles per-device OOM granularly
+                # (raw params always save; the projected-indices snapshot is
+                # best-effort), so we no longer need an outer broad catch.
                 try:
                     changed = self.logger.log_params(
                         iter_idx=epoch,
@@ -305,6 +331,9 @@ class Optimization(TreeClass):
                     _log.warning(f"epoch_callback failed at epoch {epoch}: {exc!r}")
 
             if ckpt_dir is not None and (epoch % self.checkpoint_every == 0 or epoch == self.total_epochs - 1):
+                # save_checkpoint handles its own equinox-serialisation
+                # fallback (params-only) when the optax state can't be
+                # traversed.  No outer wrapper needed.
                 save_checkpoint(
                     ckpt_dir,
                     epoch=epoch,

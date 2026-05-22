@@ -103,10 +103,21 @@ class Logger:
         experiment_name (str): Name of the experiment. This is the naming of the parent directory where the experiment
             will be saved.
         name (str | None, optional): Optional specific name for the working directory. If None, uses timestamp.
+        log_params_on_cpu (bool, optional): When True, ``log_params`` pulls device params to the host CPU and runs
+            the device-transform pipeline (smoothing / projection / masks) on CPU before writing the snapshot.
+            Required for tight-memory GPU setups where the projection scratch (~one ε-grid voxel) collides with
+            pinned FDTD-adjoint buffers and OOMs. Costs a one-time JIT recompile of the device pipeline for the
+            CPU device (a few seconds, cached). Default ``False`` keeps the snapshot on whatever device the
+            params currently live on (typically GPU), which is faster when the headroom is there.
     """
 
     def __init__(
-        self, experiment_name: str, name: str | None = None, save_source: bool = False, save_script: bool = True
+        self,
+        experiment_name: str,
+        name: str | None = None,
+        save_source: bool = False,
+        save_script: bool = True,
+        log_params_on_cpu: bool = False,
     ):
         sns.set_theme(context="paper", style="white", palette="colorblind")
         self.cwd = init_working_directory(experiment_name, wd_name=name)
@@ -136,6 +147,7 @@ class Logger:
         self.writer = None
         self.csvfile = open(self.cwd / "metrics.csv", "w", newline="")
         self.last_indices: dict[str, jax.Array | None] = defaultdict(lambda: None)
+        self.log_params_on_cpu = log_params_on_cpu
         atexit.register(self.csvfile.close)
 
     @property
@@ -280,18 +292,47 @@ class Logger:
         Returns:
             int: Number of voxels that changed since last iteration
         """
+        # The device-transform pipeline (smoothing / projection / masks)
+        # allocates scratch the size of an ε-grid voxel.  On a tight-memory
+        # GPU this collides with the just-finished FDTD adjoint's pinned
+        # buffers → OOM.  Opt in to the CPU snapshot path via
+        # ``log_params_on_cpu=True`` on the Logger (default keeps the
+        # snapshot on whatever device the params live on, which is faster
+        # when the headroom is there).  The CPU path costs a one-time JIT
+        # recompile of the device pipeline for the CPU device (a few
+        # seconds, cached for all subsequent epochs); params themselves
+        # are small (~170 KB of ρ) so the device_put is negligible.
+        if self.log_params_on_cpu:
+            cpu_device = jax.devices("cpu")[0]
+            params_to_use = jax.tree_util.tree_map(
+                lambda x: jax.device_put(x, cpu_device) if isinstance(x, jax.Array) else x,
+                params,
+            )
+        else:
+            cpu_device = None
+            params_to_use = params
+
         changed_voxels = 0
         for device in objects.devices:
-            device_params = params[device.name]
-            indices = device(device_params, **transformation_kwargs)
+            device_params = params_to_use[device.name]
 
-            # raw parameters and indices
+            # Raw params snapshot.
             if isinstance(device_params, dict):
                 device_params_dict = cast(dict[str, jax.Array], device_params)
                 for k, v in device_params_dict.items():
                     jnp.save(self.params_dir / f"params_{iter_idx}_{device.name}_{k}.npy", v)
             else:
                 jnp.save(self.params_dir / f"params_{iter_idx}_{device.name}.npy", device_params)
+
+            # Projected indices via the device transform pipeline.  When
+            # ``log_params_on_cpu`` is True the params have already been
+            # moved to CPU above and we pin execution to it; otherwise we
+            # let JAX run the transform on the params' native device.
+            if cpu_device is not None:
+                with jax.default_device(cpu_device):
+                    indices = device(device_params, **transformation_kwargs)
+            else:
+                indices = device(device_params, **transformation_kwargs)
             jnp.save(self.params_dir / f"matrix_{iter_idx}_{device.name}.npy", indices)
 
             has_previous = self.last_indices[device.name] is not None
