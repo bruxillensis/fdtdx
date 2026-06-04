@@ -56,11 +56,16 @@ from fdtdx.optimization.constraints.physics import (
     LinearSteadyStatePDEConstraint,
     PhysicsConstraint,
 )
+
 # Slow-physics solvers (ElasticityEigenmodes, PoissonSolver,
 # ElectroMechanicalFEM, pull_in_voltage, advect_density, …) have moved to
 # the sibling ``fdtdx-multiphysics`` package — install separately and
 # import from ``fdtdx_multiphysics`` in user code.  fdtdx itself stays
 # EM-only.
+from fdtdx.optimization.multistate import (
+    MultiStateOptimization,
+    accumulated_value_and_grad,
+)
 from fdtdx.optimization.objectives.function import FunctionObjective
 from fdtdx.optimization.optimization import Optimization
 from fdtdx.optimization.schedules import (
@@ -103,6 +108,7 @@ __all__ = [
     "LossTerm",
     "MinInclusion",
     "MinLineSpace",
+    "MultiStateOptimization",
     "NoFloatingMaterial",
     "OPCConstraint",
     "Objective",
@@ -111,6 +117,7 @@ __all__ = [
     "PhysicsConstraint",
     "VirtualTemperatureConnectivity",
     "WeightSchedule",
+    "accumulated_value_and_grad",
     "box_filter_2d",
     "build_arg_parser",
     "gaussian_filter_2d",
