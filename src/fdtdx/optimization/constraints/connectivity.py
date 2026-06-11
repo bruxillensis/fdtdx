@@ -220,7 +220,7 @@ class VirtualTemperatureConnectivity(LinearSteadyStatePDEConstraint):
     :math:`\\rho` — so it is a constant scale: the reported penalty is
     therefore ~1 for a fully-disconnected design and →0 as :math:`\\rho`
     forms a continuous source→drain path.  Without this normalization the raw
-    mean temperature is an un-normalized ~1e3–1e4 quantity that swamps O(1)
+    mean temperature is an un-normalized ~1e3-1e4 quantity that swamps O(1)
     objectives; the normalized form keeps the constraint weight naturally
     O(1).  Gradients flow through :func:`jax.scipy.sparse.linalg.cg` via
     implicit differentiation; the baseline is treated as a constant

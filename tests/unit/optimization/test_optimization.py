@@ -145,7 +145,7 @@ class TestOptimizationLoop:
 
         # Run loss_fn directly at epoch=0 - should be 0 since schedule gates
         # the term off entirely outside its window.
-        loss, (_, info) = opt.loss_fn(
+        loss, (_, _info) = opt.loss_fn(
             opt.params,
             opt.arrays,
             jax.random.PRNGKey(0),

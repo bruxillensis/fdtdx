@@ -118,7 +118,5 @@ def test_driver_resume(tmp_path):
         checkpoint_every=1,
     )
     MultiStateOptimization(total_epochs=3, **kw).run(key=jax.random.PRNGKey(0))
-    final = MultiStateOptimization(total_epochs=5, **kw).run(
-        key=jax.random.PRNGKey(0), resume_from=str(tmp_path)
-    )
+    final = MultiStateOptimization(total_epochs=5, **kw).run(key=jax.random.PRNGKey(0), resume_from=str(tmp_path))
     assert np.all(np.isfinite(np.asarray(final.params["x"])))

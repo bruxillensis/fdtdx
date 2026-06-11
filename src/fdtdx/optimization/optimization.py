@@ -327,7 +327,7 @@ class Optimization(TreeClass):
                         info=info,
                         optimization=self,
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     _log.warning(f"epoch_callback failed at epoch {epoch}: {exc!r}")
 
             if ckpt_dir is not None and (epoch % self.checkpoint_every == 0 or epoch == self.total_epochs - 1):

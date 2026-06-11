@@ -27,9 +27,9 @@ import jax.numpy as jnp
 __all__ = [
     "box_filter_2d",
     "gaussian_filter_2d",
-    "smooth_erosion",
-    "smooth_dilation",
     "meters_to_odd_kernel",
+    "smooth_dilation",
+    "smooth_erosion",
 ]
 
 
@@ -72,7 +72,7 @@ def box_filter_2d(rho: jax.Array, kernel_size: int) -> jax.Array:
 
 
 def _gaussian_1d_kernel(sigma: float, truncate: float) -> jax.Array:
-    radius = max(1, int(math.ceil(truncate * sigma)))
+    radius = max(1, math.ceil(truncate * sigma))
     x = jnp.arange(-radius, radius + 1, dtype=jnp.float32)
     k = jnp.exp(-(x**2) / (2.0 * max(sigma, 1e-12) ** 2))
     return k / k.sum()
@@ -120,7 +120,7 @@ def gaussian_filter_2d(
         padding=((radius, radius), (0, 0)),
         dimension_numbers=("NCHW", "OIHW", "NCHW"),
     )
-    return x.reshape(leading + (ny, nx))
+    return x.reshape((*leading, ny, nx))
 
 
 def smooth_erosion(
@@ -191,7 +191,7 @@ def meters_to_odd_kernel(length_m: float, voxel_pitch_m: float) -> int:
         raise ValueError(f"voxel_pitch_m must be > 0, got {voxel_pitch_m}")
     if length_m <= 0.0:
         raise ValueError(f"length_m must be > 0, got {length_m}")
-    k = int(round(length_m / voxel_pitch_m))
+    k = round(length_m / voxel_pitch_m)
     if k < 3:
         k = 3
     if k % 2 == 0:

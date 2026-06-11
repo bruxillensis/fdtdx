@@ -24,6 +24,7 @@ parameters through the morphology primitives in
 
 from __future__ import annotations
 
+import itertools
 from typing import Any
 
 import jax
@@ -43,8 +44,8 @@ from fdtdx.optimization.utils.morphology import (
 )
 
 __all__ = [
-    "MinLineSpace",
     "MinInclusion",
+    "MinLineSpace",
     "NoFloatingMaterial",
 ]
 
@@ -218,7 +219,7 @@ class NoFloatingMaterial(Constraint):
 
         total = jnp.asarray(0.0, dtype=jnp.float32)
         max_excess = jnp.asarray(0.0, dtype=jnp.float32)
-        for below, above in zip(rhos[:-1], rhos[1:]):
+        for below, above in itertools.pairwise(rhos):
             excess = jax.nn.relu(above - below)
             total = total + jnp.mean(excess**2)
             max_excess = jnp.maximum(max_excess, jnp.max(excess))

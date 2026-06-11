@@ -262,7 +262,7 @@ class LithographyModel(TreeClass):
         intensities = jnp.real(coherent * jnp.conj(coherent))  # (B, K, ny, nx)
         weighted = self.eigenvalues[None, :, None, None] * intensities
         aerial = jnp.sum(weighted, axis=1)  # (B, ny, nx)
-        return aerial.reshape(leading + (ny, nx))
+        return aerial.reshape((*leading, ny, nx))
 
     def forward(self, design: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Return ``(printed, aerial)``.

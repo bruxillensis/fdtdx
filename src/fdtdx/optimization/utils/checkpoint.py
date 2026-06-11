@@ -61,17 +61,14 @@ def save_checkpoint(
     meta_path = checkpoint_dir / f"checkpoint_{epoch:06d}.json"
     try:
         eqx.tree_serialise_leaves(str(eqx_path), state)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         # Some optax wrappers (e.g. ``optax.inject_hyperparams(nadam)``) wrap
         # their moment state in pytrees equinox cannot traverse — typically
         # bombs at ``opt_state.inner_state[0].mu.<device>`` with TreePathError.
         # Fall back to a params-only checkpoint so warm-starts via
         # ``--seed-from`` still work; the optimiser state is reconstructible
         # by re-running the schedule from the saved epoch.
-        logger.warning(
-            f"Full checkpoint serialisation failed ({exc!r}); writing "
-            "params-only fallback at {eqx_path}"
-        )
+        logger.warning(f"Full checkpoint serialisation failed ({exc!r}); writing params-only fallback at {{eqx_path}}")
         params_only_state: dict[str, Any] = {"params": params, "rng_key": rng_key}
         eqx.tree_serialise_leaves(str(eqx_path), params_only_state)
         meta_path.write_text(json.dumps({"epoch": int(epoch), "params_only": True}))
@@ -224,7 +221,7 @@ def _find_latest_seed_iter(params_dir: Path, device_names: list[str]) -> int:
             continue
         iter_idx_ = int(m.group(1))
         rest = m.group(2)
-        sorted_devices = cast(list[str], sorted(device_names, key=len, reverse=True))
+        sorted_devices = sorted(device_names, key=len, reverse=True)
         for dev_name in sorted_devices:
             if rest == dev_name or rest.startswith(dev_name + "_"):
                 iters_per_device[dev_name].add(iter_idx_)

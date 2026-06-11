@@ -32,7 +32,7 @@ class _StubDevice:
         self.name = name
         self._rho = rho
         self.single_voxel_real_shape = (voxel_pitch_m, voxel_pitch_m, voxel_pitch_m)
-        self.matrix_voxel_grid_shape = rho.shape + (1,) if rho.ndim == 2 else rho.shape
+        self.matrix_voxel_grid_shape = (*rho.shape, 1) if rho.ndim == 2 else rho.shape
 
     def __call__(self, _params: jax.Array) -> jax.Array:
         return self._rho
