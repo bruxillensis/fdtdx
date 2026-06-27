@@ -28,6 +28,7 @@ API
     fdtdx.compute_poynting_flux
     fdtdx.ConnectHolesAndStructures
     fdtdx.CustomModeOverlapDetector
+    fdtdx.CustomProfilePlaneSource
     fdtdx.CustomTimeSignalProfile
     fdtdx.Cylinder
     fdtdx.Detector

@@ -114,7 +114,11 @@ from fdtdx.objects.object import (
     SizeExtensionConstraint,
 )
 from fdtdx.objects.sources.dipole import PointDipoleSource
-from fdtdx.objects.sources.linear_polarization import GaussianPlaneSource, UniformPlaneSource
+from fdtdx.objects.sources.linear_polarization import (
+    CustomProfilePlaneSource,
+    GaussianPlaneSource,
+    UniformPlaneSource,
+)
 from fdtdx.objects.sources.mode import ModePlaneSource
 from fdtdx.objects.sources.profile import (
     CustomTimeSignalProfile,
@@ -171,6 +175,7 @@ __all__ = [
     "Color",
     "ConnectHolesAndStructures",
     "CustomModeOverlapDetector",
+    "CustomProfilePlaneSource",
     "CustomTimeSignalProfile",
     "Cylinder",
     "Detector",
