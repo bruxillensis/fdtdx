@@ -1,4 +1,4 @@
-from typing import ClassVar, Literal, Self, Sequence
+from typing import TYPE_CHECKING, ClassVar, Literal, Self, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +9,9 @@ from fdtdx.core.physics.metrics import compute_poynting_flux, net_poynting_flux_
 from fdtdx.objects.detectors.detector import Detector, DetectorState
 from fdtdx.objects.detectors.phasor import PhasorDetector
 from fdtdx.typing import SliceTuple3D
+
+if TYPE_CHECKING:
+    from fdtdx.fdtd.container import ArrayContainer
 
 
 def _resolve_face_area_weights(
@@ -530,3 +533,18 @@ class ClosedSurfacePhasorPoyntingFluxDetector(PhasorDetector):
         if self.scaling_mode == "continuous":
             net = 0.5 * net
         return net
+
+    def measured_power_spectrum(
+        self,
+        arrays: "ArrayContainer",
+        frequencies: jax.Array | None = None,
+    ) -> jax.Array:
+        """Net power through the closed surface per frequency — the measured power for
+        :meth:`~fdtdx.Detector.transmission`.
+
+        Overrides the plane-detector implementation inherited from ``PhasorDetector``, which
+        expects a single singleton axis. For a dipole this is the total radiated power,
+        including any Purcell enhancement from the surrounding structure.
+        """
+        del frequencies  # phasors are recorded at wave_characters
+        return self.compute_net_flux(arrays.detector_states[self.name])

@@ -205,3 +205,41 @@ def test_waveguide_sparam_transmission():
             f"expected > {1.0 - _TOLERANCE:.2f} "
             f"(lossless Si/SiO2 slab waveguide should transmit large % of TE mode power)"
         )
+
+
+def test_modal_transmission_matches_sparam_and_bounds_total():
+    """``ModeOverlapDetector.modal_transmission`` is consistent with |S|² and ≤ total transmission.
+
+    ``modal_transmission = |overlap|² / injected_power``. Taking the ratio of an output detector
+    to the input reference detector cancels the injected-power normalisation and must equal
+    |S|² (the mode-overlap S-parameter) — ~1 for this lossless slab. Independently, the
+    single-mode power must not exceed the *total* plane power that the inherited
+    :meth:`~fdtdx.Detector.transmission` reports (modal coupling ≤ total throughput).
+    """
+    objects, constraints, config = _build_waveguide_sparams()
+
+    key = jax.random.PRNGKey(0)
+    oc, arrays, params, config, _ = fdtdx.place_objects(
+        object_list=objects, config=config, constraints=constraints, key=key
+    )
+    arrays = fdtdx.extend_material_to_pml(objects=oc, arrays=arrays)
+    arrays, oc, _ = fdtdx.apply_params(arrays, oc, params, key)
+    _, arrays = fdtdx.run_fdtd(arrays=arrays, objects=oc, config=config, key=key)
+
+    source = oc["source"]
+    mt_in = np.asarray(oc["det_source"].modal_transmission(arrays, source))
+    mt_near = np.asarray(oc["det_near"].modal_transmission(arrays, source))
+
+    assert mt_in.shape == (1,) and mt_near.shape == (1,)
+    assert np.all(np.isfinite(mt_in)) and np.all(np.isfinite(mt_near))
+    assert float(mt_in[0]) > 0
+
+    # Ratio cancels the injected-power normalisation -> equals |S(det_near)|² (~1, lossless slab).
+    ratio = float(mt_near[0]) / float(mt_in[0])
+    assert ratio > (1.0 - _TOLERANCE) and ratio <= 1.0001, f"modal ratio {ratio:.4f} should equal |S|² ~ 1"
+
+    # Single-mode coupling cannot exceed the total plane power (inherited total transmission).
+    total_near = float(np.asarray(oc["det_near"].transmission(arrays, source))[0])
+    assert float(mt_near[0]) <= total_near * (1.0 + _TOLERANCE), (
+        f"modal {float(mt_near[0]):.4f} exceeds total {total_near:.4f}"
+    )

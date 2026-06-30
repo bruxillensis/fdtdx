@@ -1,5 +1,5 @@
 import math
-from typing import Literal, Self, Sequence
+from typing import TYPE_CHECKING, Literal, Self, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -7,10 +7,14 @@ from loguru import logger
 
 from fdtdx.config import SimulationConfig
 from fdtdx.core.jax.pytrees import autoinit, field, frozen_field, frozen_private_field, private_field
+from fdtdx.core.physics.metrics import compute_poynting_flux
 from fdtdx.core.wavelength import WaveCharacter
 from fdtdx.core.window import TemporalWindow
 from fdtdx.objects.detectors.detector import Detector, DetectorState
 from fdtdx.typing import SliceTuple3D
+
+if TYPE_CHECKING:
+    from fdtdx.fdtd.container import ArrayContainer
 
 # Oversampling margin for the "auto" DFT subsampling stride: keep about this many samples per
 # period of the highest recorded frequency.
@@ -174,6 +178,16 @@ class PhasorDetector(Detector):
             return self._dft_stride
         raise Exception(f"Invalid scaling mode: {self.scaling_mode=}")
 
+    def _phasor_factor(self, time_step: jax.Array) -> jax.Array:
+        """Per-step windowed-DFT factor, shape ``(num_freqs,)``.
+
+        Single implementation of the windowed-DFT accumulation
+        ``exp(i w t) * static_scale * window_weight``.
+        """
+        time_passed = time_step * self._config.time_step_duration
+        window_weight = self._window_at_time_step_arr[time_step]
+        return jnp.exp(1j * self._angular_frequencies * time_passed) * self._static_scale() * window_weight
+
     def _num_latent_time_steps(self) -> int:
         return 1
 
@@ -197,9 +211,8 @@ class PhasorDetector(Detector):
         inv_permeability: jax.Array | float,
     ) -> DetectorState:
         del inv_permeability, inv_permittivity
-        time_passed = time_step * self._config.time_step_duration
-        static_scale = self._static_scale()
-        window_weight = self._window_at_time_step_arr[time_step]
+        if self.scaling_mode not in ("continuous", "pulse"):
+            raise Exception(f"Invalid scaling mode: {self.scaling_mode=}")
 
         fields = []
         if "Ex" in self.components:
@@ -217,12 +230,11 @@ class PhasorDetector(Detector):
 
         EH = jnp.stack(fields, axis=0)
 
-        # Vectorized phasor calculation for all frequencies
-        phase_angles = self._angular_frequencies * time_passed  # Shape: (num_freqs,)
-        phasors = jnp.exp(1j * phase_angles)  # Shape: (num_freqs,)
+        # Vectorized phasor calculation for all frequencies (windowed-DFT factor, shared helper).
+        phasors = self._phasor_factor(time_step)  # Shape: (num_freqs,)
         # Reshape phasors to (num_freqs, 1, 1, 1, 1) for proper broadcasting with EH (num_components, x, y, z)
         phasors = phasors.reshape((len(self._angular_frequencies),) + (1,) * EH.ndim)
-        new_phasors = EH * phasors * static_scale * window_weight  # Shape: (num_freqs, num_components, *grid_shape)
+        new_phasors = EH * phasors  # (num_freqs, num_components, *grid_shape)
 
         if self.reduce_volume:
             # Average over spatial dimensions using physical cell volumes.
@@ -233,3 +245,61 @@ class PhasorDetector(Detector):
         else:
             result = state["phasor"] + new_phasors[None, ...]
         return {"phasor": result.astype(self.dtype)}
+
+    def _plane_normal_axis(self) -> int:
+        grid_shape = self.grid_shape
+        if sum(s == 1 for s in grid_shape) != 1:
+            raise ValueError(f"flux_spectrum expects a plane detector (one singleton axis); got {grid_shape}")
+        return grid_shape.index(1)
+
+    def _face_area(self, axis: int) -> jax.Array:
+        grid = self._config.resolved_grid
+        if grid is not None:
+            return grid.face_area(axis=axis, slice_tuple=self.grid_slice_tuple)
+        spacing = self._config.uniform_spacing()
+        return jnp.ones(self.grid_shape, dtype=jnp.float32) * spacing * spacing
+
+    def flux_spectrum(self, arrays: "ArrayContainer") -> jax.Array:
+        """Net time-averaged Poynting flux through this plane detector, per frequency.
+
+        ``½ Re ∮ (E x H*)·n̂ dA`` evaluated from the recorded phasors (un-scaled to the raw
+        windowed-DFT convention), for every frequency in ``wave_characters``. Requires a plane
+        detector (one singleton axis) recording all six components in the default order
+        (``Ex, Ey, Ez, Hx, Hy, Hz``) with ``reduce_volume=False``.
+
+        Returns:
+            Real ``jax.Array`` of shape ``(num_freqs,)`` — net flux along the +normal axis.
+        """
+        if self.reduce_volume:
+            raise ValueError("flux_spectrum requires reduce_volume=False (it integrates over the plane).")
+        phasor = arrays.detector_states[self.name]["phasor"]  # (1, num_freqs, num_components, *spatial)
+        if phasor.shape[2] != 6:
+            raise ValueError("flux_spectrum requires the detector to record all 6 components (Ex..Hz).")
+
+        axis = self._plane_normal_axis()
+        area = self._face_area(axis)
+        static_scale = self._static_scale()
+        num_freqs = phasor.shape[1]
+
+        def flux_at(freq_index: jax.Array) -> jax.Array:
+            e_field = phasor[0, freq_index, :3] / static_scale
+            h_field = phasor[0, freq_index, 3:] / static_scale
+            poynting = compute_poynting_flux(e_field, h_field, axis=0)[axis]
+            return 0.5 * jnp.real(jnp.sum(poynting * area))
+
+        return jax.vmap(flux_at)(jnp.arange(num_freqs))
+
+    def measured_power_spectrum(
+        self,
+        arrays: "ArrayContainer",
+        frequencies: jax.Array | None = None,
+    ) -> jax.Array:
+        """Plane Poynting flux per frequency — the measured power for ``transmission``."""
+        del frequencies  # phasors are recorded at wave_characters; injected side uses those
+        return self.flux_spectrum(arrays)
+
+    def _injection_apodization(self):
+        return self.apodization
+
+    def _default_transmission_frequencies(self) -> jax.Array:
+        return jnp.asarray([wc.get_frequency() for wc in self.wave_characters])

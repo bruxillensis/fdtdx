@@ -13,6 +13,7 @@ from fdtdx.core.misc import linear_interpolated_indexing, normalize_polarization
 from fdtdx.core.null import NULL
 from fdtdx.core.switch import OnOffSwitch
 from fdtdx.core.wavelength import WaveCharacter
+from fdtdx.core.window import TemporalWindow
 from fdtdx.objects.object import SimulationObject
 from fdtdx.objects.sources.profile import SingleFrequencyProfile, TemporalProfile
 from fdtdx.typing import SliceTuple3D
@@ -164,6 +165,40 @@ class Source(SimulationObject, ABC):
             phase_shift=self.wave_character.phase_shift,
             filename=filename,
             **kwargs,
+        )
+
+    def injected_power_spectrum(
+        self,
+        frequencies: jax.Array,
+        *,
+        apodization: TemporalWindow | None = None,
+    ) -> jax.Array:
+        """Analytic power injected by this source as a function of frequency.
+
+        Returns the per-frequency injected power ("source power"), computed analytically
+        from the source's spatial profile and temporal signal — no simulation run. For the
+        *measured* radiated power (which includes the environment / Purcell effect), use
+        :class:`~fdtdx.ClosedSurfacePhasorPoyntingFluxDetector`.
+
+        The result shares the DFT convention of a co-located all-component
+        :class:`~fdtdx.PhasorDetector` (``scaling_mode="pulse"``), so it can divide a
+        :meth:`~fdtdx.PhasorDetector.flux_spectrum` to form a :meth:`~fdtdx.Detector.transmission`.
+        In that ratio the temporal pulse spectrum cancels (so transmission is independent of pulse
+        shape); the absolute value does depend on the temporal profile.
+
+        Args:
+            frequencies: Frequencies (Hz) at which to evaluate the injected power.
+            apodization: Optional temporal window (a :class:`TemporalWindow`) applied to the
+                source signal — must match the output detector's ``apodization`` for a
+                consistent :meth:`~fdtdx.Detector.transmission`.
+
+        Returns:
+            Real-valued ``jax.Array`` of shape ``(len(frequencies),)``.
+        """
+        del frequencies, apodization
+        raise NotImplementedError(
+            f"injected_power_spectrum is not implemented for {type(self).__name__}. "
+            "Use a ClosedSurfacePhasorPoyntingFluxDetector (a measured flux box) for this source type."
         )
 
     @abstractmethod

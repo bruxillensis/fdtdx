@@ -1,7 +1,7 @@
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Literal, Self, Sequence
+from typing import TYPE_CHECKING, Literal, Self, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +21,10 @@ from fdtdx.dispersion import effective_complex_inv_permittivity
 from fdtdx.objects.detectors.detector import DetectorState
 from fdtdx.objects.detectors.phasor import PhasorDetector
 from fdtdx.typing import SliceTuple3D
+
+if TYPE_CHECKING:
+    from fdtdx.fdtd.container import ArrayContainer
+    from fdtdx.objects.sources.source import Source
 
 
 def gaussian_mode_fields(
@@ -251,7 +255,12 @@ class BaseModeOverlapDetector(PhasorDetector, ABC):
         return self
 
     def _face_area_weights(self) -> jax.Array:
-        """Return detector-plane face areas for mode-overlap integration."""
+        """Return detector-plane face-area weights for mode-overlap integration.
+
+        Normalized to mean 1, not physical cell areas — unlike the same-named helper on the
+        Poynting-flux detectors. The reference mode is normalized with these weights too, so
+        the scale cancels within the overlap but not against a physical power.
+        """
         return self._cached_face_area_weights
 
     def _plane_coordinates(self) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -428,6 +437,12 @@ class BaseModeOverlapDetector(PhasorDetector, ABC):
     ) -> jax.Array:
         """Compute mode overlaps at every frequency in ``wave_characters``.
 
+        The coefficient is weighted by :meth:`_face_area_weights`, which is normalized to
+        mean 1 rather than to physical cell areas. It is therefore meaningful in *ratios* —
+        S-parameters divide two overlaps, so the scaling cancels — but ``|alpha|^2`` is not
+        a power in watts. To compare against a Poynting flux or an injected power, rescale
+        by the mean physical face area, as :meth:`modal_transmission` does.
+
         Returns:
             Complex array of shape ``(num_freqs,)``.
         """
@@ -443,6 +458,57 @@ class BaseModeOverlapDetector(PhasorDetector, ABC):
             for i in range(len(self.wave_characters))
         ]
         return jnp.stack(overlaps, axis=0)
+
+    def modal_transmission(
+        self,
+        arrays: "ArrayContainer",
+        source: "Source",
+        *,
+        frequencies: jax.Array | None = None,
+    ) -> jax.Array:
+        """Power fraction coupled into the reference mode(s): ``|overlap|^2 / injected``.
+
+        Distinct from the inherited :meth:`~fdtdx.Detector.transmission`, which returns the
+        *total* net power through the detector plane (all modes + radiation, via the plane
+        Poynting flux). This returns the single-mode coupling efficiency — the fraction of the
+        injected source power that ends up in this detector's reference mode(s). For an
+        S-parameter (complex amplitude with phase), use :meth:`compute_overlap` against a
+        reference input port instead.
+
+        The detector's own apodization window is forwarded to the source so the temporal pulse
+        spectrum cancels in the ratio (use a ``GaussianPulseProfile`` source for a
+        position-independent fraction). Requires ``scaling_mode="pulse"`` so the modal power and
+        the source's ``injected_power_spectrum`` share the raw windowed-DFT, eta0-normalized
+        convention (the same one :meth:`~fdtdx.Detector.transmission` uses).
+
+        Args:
+            arrays: Simulation arrays holding this detector's recorded state.
+            source: The injecting source (must be post-``apply_params``).
+            frequencies: Optional frequencies (Hz); defaults to the detector's ``wave_characters``.
+
+        Returns:
+            Real ``jax.Array`` of shape ``(num_freqs,)`` — modal power fraction per frequency.
+        """
+        if self.scaling_mode != "pulse":
+            raise ValueError(
+                "modal_transmission requires scaling_mode='pulse' so the modal power and the "
+                "source's injected_power_spectrum share the raw windowed-DFT convention."
+            )
+        if frequencies is None:
+            frequencies = self._default_transmission_frequencies()
+        freqs = jnp.asarray(frequencies)
+        state = arrays.detector_states[self.name]
+        # compute_overlap returns the raw coefficient; in "pulse" scaling it omits the 1/4 Poynting
+        # normalization (kept out so it cancels in S-parameter ratios). Re-apply it here so that
+        # |a|^2 is a true modal power in the same convention as the injected power.
+        modal_amplitude = self.compute_overlap(state) / 4.0
+        # ``_face_area_weights`` is normalized to mean 1, so the reference mode carries a
+        # physical power of one mean cell area rather than one watt. Restore that scale to
+        # put the modal power in the same units as ``injected_power_spectrum``.
+        mean_face_area = jnp.mean(self._face_area(self.propagation_axis))
+        modal_power = (jnp.abs(modal_amplitude) ** 2) * mean_face_area
+        injected = source.injected_power_spectrum(freqs, apodization=self._injection_apodization())
+        return modal_power / injected
 
 
 @autoinit

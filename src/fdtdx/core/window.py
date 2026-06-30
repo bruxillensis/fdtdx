@@ -55,6 +55,32 @@ def tukey_envelope(
     return jnp.where(in_range, window, 0.0)
 
 
+def windowed_dft(
+    signal: jax.Array,
+    window: jax.Array,
+    frequencies: jax.Array,
+    dt: float,
+) -> jax.Array:
+    """Complex windowed DFT ``S(f) = sum_n window[n] * signal[n] * exp(i w_f n dt)``.
+
+    Evaluated at arbitrary (not necessarily FFT-bin) ``frequencies`` in Hz.
+
+    Args:
+        signal: Real or complex time signal, shape ``(num_time_steps,)``.
+        window: Per-step weights of the same shape (use all-ones for no window).
+        frequencies: Frequencies in Hz, shape ``(num_freqs,)``.
+        dt: Time-step duration in seconds.
+
+    Returns:
+        Complex array of shape ``(num_freqs,)``.
+    """
+    n = jnp.arange(signal.shape[0])
+    omega = 2.0 * jnp.pi * jnp.asarray(frequencies)  # (num_freqs,)
+    phase = jnp.exp(1j * omega[:, None] * (n[None, :] * dt))  # (num_freqs, num_time_steps)
+    weighted = window * signal  # (num_time_steps,)
+    return jnp.sum(phase * weighted[None, :], axis=1)
+
+
 class TemporalWindow(TreeClass, ABC):
     """Base class for carrier-free temporal windows used as detector apodization."""
 
