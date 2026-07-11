@@ -94,6 +94,12 @@ class FieldProjectionDetectorBase(PhasorDetector):
     The detector records complex E/H phasors on a planar surface or box, then
     projects equivalent surface currents to observation coordinates supplied by
     concrete subclasses.
+
+    Projected fields are returned in FDTDX's native field convention — the pair
+    ``(E, eta0*H)`` with ``|H| = n * |E|`` for a plane wave — so the returned
+    ``power`` (radial Poynting density at the observation points) is directly
+    commensurate with every other flux quantity in FDTDX, such as the plane flux
+    of a ``PoyntingFluxDetector`` or powers derived from raw detector phasors.
     """
 
     #: Direction of the outward detector normal for a single planar detector
@@ -452,6 +458,11 @@ class FieldProjectionDetectorBase(PhasorDetector):
         else:
             phasor = self._state_surface_phasor(state, surface)[0, wave_character_index]
             propagation_axis, direction = _surface_axis_direction(surface)
+        # FDTDX records (E, eta0*H). Scaling E by eta0 makes the pair uniformly eta0-scaled SI,
+        # so the SI radiation integrals below apply verbatim and the two equivalent currents
+        # (J = n x H, M = -n x E) stay numerically balanced. Each surface's projected E
+        # contribution is divided by eta0 again before the coherent surface sum, so results
+        # are returned in FDTDX's native (E, eta0*H) convention.
         e_global = constants.eta0 * phasor[:3]
         h_global = phasor[3:6]
 
@@ -845,7 +856,13 @@ class FieldProjectionDetectorBase(PhasorDetector):
                 batch_size=int(self.exact_projection_batch_size),
             )
 
-        return {key: projected[index].reshape(observation_shape) for index, key in enumerate(_PROJECTION_FIELD_KEYS)}
+        fields = {key: projected[index].reshape(observation_shape) for index, key in enumerate(_PROJECTION_FIELD_KEYS)}
+        # Convert this surface's contribution from the internal eta0-scaled SI pair back to
+        # FDTDX's native (E, eta0*H) convention. Done per surface (before the coherent surface
+        # sum) so a box projection stays operation-identical to the sum of its face projections.
+        for key in ("Er", "Etheta", "Ephi"):
+            fields[key] = fields[key] / constants.eta0
+        return fields
 
     def _surface_projection_context(
         self,
@@ -874,7 +891,13 @@ class FieldProjectionDetectorBase(PhasorDetector):
         *,
         wave_character_index: int,
     ) -> dict[str, Any]:
-        """Assemble projected fields, Poynting power, coordinates, surfaces, and frequency metadata."""
+        """Assemble projected fields, Poynting power, coordinates, surfaces, and frequency metadata.
+
+        ``fields`` arrives already converted to FDTDX's native ``(E, eta0*H)`` convention (the
+        conversion happens per surface contribution, see ``_local_plane_fields``), so ``power``
+        is directly commensurate with every other flux quantity in FDTDX (e.g. the plane flux
+        recorded by ``PoyntingFluxDetector`` or the raw detector phasors).
+        """
         power = 0.5 * jnp.real(
             fields["Etheta"] * jnp.conj(fields["Hphi"]) - fields["Ephi"] * jnp.conj(fields["Htheta"])
         )
@@ -966,10 +989,14 @@ class FieldProjectionDetectorBase(PhasorDetector):
         h_theta = -e_phi / impedance
         h_phi = e_theta / impedance
         propagation_factor = -1j * wavenumber * jnp.exp(1j * wavenumber * distance) / (4.0 * jnp.pi * distance)
+        # The radiation integrals above act on the internal eta0-scaled SI pair, so the E
+        # components carry an extra factor eta0. Dividing them here returns the fields in
+        # FDTDX's native (E, eta0*H) convention; the impedance-derived H components already
+        # come out as eta0*H_SI and need no conversion.
         fields = {
             "Er": jnp.zeros_like(e_theta),
-            "Etheta": propagation_factor * e_theta,
-            "Ephi": propagation_factor * e_phi,
+            "Etheta": propagation_factor * e_theta / constants.eta0,
+            "Ephi": propagation_factor * e_phi / constants.eta0,
             "Hr": jnp.zeros_like(h_theta),
             "Htheta": propagation_factor * h_theta,
             "Hphi": propagation_factor * h_phi,
