@@ -9,6 +9,7 @@ correct to discretization accuracy.
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 import fdtdx
 
@@ -100,7 +101,7 @@ def test_analytic_injected_power_matches_measured_flux():
     assert float(analytic[0]) > 0
     rel_err = abs(float(measured[0]) - float(analytic[0])) / float(analytic[0])
     # Analytic source power must reproduce the measured plane flux to discretization accuracy.
-    assert rel_err < 0.05, f"analytic={float(analytic[0]):.3e} measured={float(measured[0]):.3e} rel_err={rel_err:.3f}"
+    assert rel_err < 0.015, f"analytic={float(analytic[0]):.3e} measured={float(measured[0]):.3e} rel_err={rel_err:.3f}"
 
 
 def test_transmission_unity_in_homogeneous_medium():
@@ -109,7 +110,7 @@ def test_transmission_unity_in_homogeneous_medium():
     _add_plane_phasor("out", 40, wave, volume, objects, constraints)
     oc, arrays = _run(objects, constraints, config)
     t = oc["out"].transmission(arrays, oc["source"])
-    assert abs(float(t[0]) - 1.0) < 0.05, f"transmission={float(t[0]):.3f}"
+    assert abs(float(t[0]) - 1.0) < 0.015, f"transmission={float(t[0]):.3f}"
 
 
 def test_transmission_matches_fresnel():
@@ -143,4 +144,98 @@ def test_transmission_matches_fresnel():
     # no-interface T=1 case, and the explicit t<0.95 guard makes the dip mandatory: the test
     # cannot pass if the dielectric half-space is silently ignored.
     assert float(t[0]) < 0.95, f"no Fresnel dip seen: T_measured={float(t[0]):.3f}"
-    assert rel_err < 0.05, f"T_measured={float(t[0]):.3f} T_analytic={t_analytic:.3f} rel_err={rel_err:.3f}"
+    assert rel_err < 0.035, f"T_measured={float(t[0]):.3f} T_analytic={t_analytic:.3f} rel_err={rel_err:.3f}"
+
+
+def test_transmitted_plus_reflected_power_is_conserved():
+    """Lossless dielectric interface -> T + R = 1 measured on both branches.
+
+    The existing Fresnel test checks T against theory; this checks the two measured branches
+    against *each other*, so a normalization error common to both would still fail. The source
+    is TFSF, so a detector upstream of the source plane sees only the scattered (reflected)
+    field.
+    """
+    eps_r = 4.0
+    n1, n2 = 1.0, float(np.sqrt(eps_r))
+    t_analytic = 4.0 * n1 * n2 / (n1 + n2) ** 2
+    r_analytic = ((n1 - n2) / (n1 + n2)) ** 2
+    assert abs(t_analytic + r_analytic - 1.0) < 1e-12  # guard the analytic pair itself
+
+    objects, constraints, config, volume, wave = _build_base()
+    interface_z = 28
+    diel = fdtdx.UniformMaterialObject(
+        name="slab",
+        partial_grid_shape=(None, None, 60 - interface_z),
+        material=fdtdx.Material(permittivity=eps_r),
+    )
+    constraints.extend(
+        [
+            diel.same_size(volume, axes=(0, 1)),
+            diel.place_at_center(volume, axes=(0, 1)),
+            diel.set_grid_coordinates(axes=(2,), sides=("-",), coordinates=(interface_z,)),
+        ]
+    )
+    objects.append(diel)
+    _add_plane_phasor("out", 40, wave, volume, objects, constraints)
+    _add_plane_phasor("back", 10, wave, volume, objects, constraints)  # upstream of the source
+    oc, arrays = _run(objects, constraints, config)
+
+    injected = oc["source"].injected_power_spectrum(jnp.array([wave.get_frequency()]))
+    t = float(oc["out"].transmission(arrays, oc["source"])[0])
+    # The reflected branch travels -z, so its plane flux is negative; take the magnitude.
+    r = abs(float(oc["back"].flux_spectrum(arrays)[0])) / float(injected[0])
+
+    # Conservation is the tight claim here: T+R holds to ~0.4% at this resolution. R's own
+    # absolute error is interface-discretization limited and converges as O(h) -- measured
+    # 10.2% at 50 nm, 4.4% at 33 nm, 2.4% at 25 nm -- so its bound is only a coarse guard
+    # against a gross normalization error in the reflected branch.
+    assert t == pytest.approx(t_analytic, rel=0.035), f"T={t:.3f} vs {t_analytic:.3f}"
+    assert r == pytest.approx(r_analytic, rel=0.13), f"R={r:.3f} vs {r_analytic:.3f}"
+    assert t + r == pytest.approx(1.0, abs=0.012), f"T+R={t + r:.4f} is not conserved (T={t:.3f}, R={r:.3f})"
+
+
+def test_closed_surface_box_reports_zero_net_power_for_a_lossless_slab():
+    """A box around a lossless slab radiates nothing net: what enters leaves.
+
+    Exercises the ``ClosedSurfacePhasorPoyntingFluxDetector`` power path end-to-end in a real
+    run — the same override ``transmission`` uses for closed surfaces.
+    """
+    objects, constraints, config, volume, wave = _build_base()
+    interface_z, slab_end = 28, 44
+    diel = fdtdx.UniformMaterialObject(
+        name="slab",
+        partial_grid_shape=(None, None, slab_end - interface_z),
+        material=fdtdx.Material(permittivity=4.0),
+    )
+    constraints.extend(
+        [
+            diel.same_size(volume, axes=(0, 1)),
+            diel.place_at_center(volume, axes=(0, 1)),
+            diel.set_grid_coordinates(axes=(2,), sides=("-",), coordinates=(interface_z,)),
+        ]
+    )
+    objects.append(diel)
+
+    box = fdtdx.ClosedSurfacePhasorPoyntingFluxDetector(
+        name="box",
+        partial_grid_shape=(None, None, (slab_end + 4) - (interface_z - 4)),
+        wave_characters=(wave,),
+        scaling_mode="pulse",
+    )
+    constraints.extend(
+        [
+            box.same_size(volume, axes=(0, 1)),
+            box.place_at_center(volume, axes=(0, 1)),
+            box.set_grid_coordinates(axes=(2,), sides=("-",), coordinates=(interface_z - 4,)),
+        ]
+    )
+    objects.append(box)
+    _add_plane_phasor("src_plane", 18, wave, volume, objects, constraints)
+    oc, arrays = _run(objects, constraints, config)
+
+    incident = float(oc["src_plane"].flux_spectrum(arrays)[0])
+    net = float(oc["box"].measured_power_spectrum(arrays)[0])
+    assert incident > 0
+    # Nothing is absorbed or created inside, so the net outward power is a small fraction of
+    # the power flowing through the box.
+    assert abs(net) / incident < 0.005, f"net box power {net:.3e} is not negligible vs incident {incident:.3e}"
