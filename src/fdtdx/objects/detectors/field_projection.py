@@ -353,13 +353,9 @@ class FieldProjectionDetectorBase(PhasorDetector):
             )
 
         del inv_permeability, inv_permittivity
-        time_passed = time_step * self._config.time_step_duration
-        static_scale = self._static_scale()
-
         fields = jnp.concatenate((E, H), axis=0)
-        phase_angles = self._angular_frequencies * time_passed
-        phasors = jnp.exp(1j * phase_angles)
-        phasors = phasors.reshape((len(self._angular_frequencies),) + (1,) * fields.ndim)
+        # Shared windowed-DFT factor, so apodization applies here exactly as on a plane detector.
+        phasors = self._phasor_factor(time_step).reshape((len(self._angular_frequencies),) + (1,) * fields.ndim)
 
         new_state: DetectorState = {}
         for surface in self._included_box_surfaces():
@@ -367,7 +363,7 @@ class FieldProjectionDetectorBase(PhasorDetector):
             face_slices: list[slice] = [slice(None), slice(None), slice(None), slice(None)]
             face_slices[axis + 1] = slice(0, 1) if direction == "-" else slice(self.grid_shape[axis] - 1, None)
             face_fields = fields[tuple(face_slices)]
-            new_phasors = face_fields * phasors * static_scale
+            new_phasors = face_fields * phasors
             state_key = _surface_state_key(surface)
             if self.inverse:
                 result = state[state_key] - new_phasors[None, ...]

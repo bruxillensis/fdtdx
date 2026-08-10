@@ -486,13 +486,10 @@ class ClosedSurfacePhasorPoyntingFluxDetector(PhasorDetector):
         inv_permeability: jax.Array | float,
     ) -> DetectorState:
         del inv_permeability, inv_permittivity
-        time_passed = time_step * self._config.time_step_duration
-        static_scale = self._static_scale()
-
         EH = jnp.stack([E[0], E[1], E[2], H[0], H[1], H[2]], axis=0)  # (6, nx, ny, nz)
-        phase_angles = self._angular_frequencies * time_passed  # (num_freqs,)
-        phasors = jnp.exp(1j * phase_angles).reshape((len(self._angular_frequencies),) + (1,) * EH.ndim)
-        new_phasors = EH * phasors * static_scale  # (num_freqs, 6, nx, ny, nz)
+        # Shared windowed-DFT factor, so apodization applies here exactly as on a plane detector.
+        phasors = self._phasor_factor(time_step).reshape((len(self._angular_frequencies),) + (1,) * EH.ndim)
+        new_phasors = EH * phasors  # (num_freqs, 6, nx, ny, nz)
 
         new_state = dict(state)
         for a in self._resolve_active_axes():
@@ -545,6 +542,20 @@ class ClosedSurfacePhasorPoyntingFluxDetector(PhasorDetector):
         Overrides the plane-detector implementation inherited from ``PhasorDetector``, which
         expects a single singleton axis. For a dipole this is the total radiated power,
         including any Purcell enhancement from the surrounding structure.
+
+        Reported in the same power convention as :meth:`~fdtdx.PhasorDetector.flux_spectrum`,
+        since that is what :meth:`~fdtdx.Detector.transmission` divides by an injected power.
+        This differs from :meth:`compute_net_flux` by a constant factor in both scaling modes;
+        use ``compute_net_flux`` for the raw closed-surface value in this detector's own
+        convention.
         """
         del frequencies  # phasors are recorded at wave_characters
-        return self.compute_net_flux(arrays.detector_states[self.name])
+        # compute_net_flux keeps its own standalone convention: recorded phasors, with the 1/2
+        # time average applied only in continuous mode (where phasors are peak amplitudes).
+        # transmission() divides by a raw windowed-DFT injected power, so convert to the
+        # convention flux_spectrum reports: raw phasors, 1/2 always. The flux is quadratic in
+        # the phasors, hence the squared un-scale.
+        net = self.compute_net_flux(arrays.detector_states[self.name]) / self._raw_dft_scale() ** 2
+        if self.scaling_mode != "continuous":
+            net = 0.5 * net
+        return net

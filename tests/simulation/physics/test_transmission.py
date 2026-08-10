@@ -239,3 +239,73 @@ def test_closed_surface_box_reports_zero_net_power_for_a_lossless_slab():
     # Nothing is absorbed or created inside, so the net outward power is a small fraction of
     # the power flowing through the box.
     assert abs(net) / incident < 0.005, f"net box power {net:.3e} is not negligible vs incident {incident:.3e}"
+
+
+@pytest.mark.parametrize("scaling_mode", ["pulse", "continuous"])
+def test_closed_box_around_the_source_reports_the_injected_power(scaling_mode):
+    """A box enclosing the source in vacuum radiates exactly the power the source injects.
+
+    The transverse faces carry no flux for a normally-propagating plane wave under periodic
+    transverse boundaries, and the TFSF source injects only in +z, so the net outward power
+    equals the injected power and the transmitted fraction is 1. Unlike the lossless-slab test
+    above, the expected value is *non-zero*, so a constant factor in the closed-surface power
+    convention cannot hide in it — any multiple of zero is still zero.
+    """
+    objects, constraints, config, volume, wave = _build_base()
+    box_z0, box_z1 = 10, 24  # the source sits at z-cell 14
+    box = fdtdx.ClosedSurfacePhasorPoyntingFluxDetector(
+        name="box",
+        partial_grid_shape=(None, None, box_z1 - box_z0),
+        wave_characters=(wave,),
+        scaling_mode=scaling_mode,
+    )
+    constraints.extend(
+        [
+            box.same_size(volume, axes=(0, 1)),
+            box.place_at_center(volume, axes=(0, 1)),
+            box.set_grid_coordinates(axes=(2,), sides=("-",), coordinates=(box_z0,)),
+        ]
+    )
+    objects.append(box)
+    oc, arrays = _run(objects, constraints, config)
+
+    t = float(oc["box"].transmission(arrays, oc["source"])[0])
+    # 1.5% is the same discretization band the plane-detector transmission tests use; it is far
+    # tighter than the constant factors this guards against (2x in pulse mode, ~1e-5 in continuous).
+    assert t == pytest.approx(1.0, abs=0.015), f"closed-box transmission={t:.5f} ({scaling_mode})"
+
+
+@pytest.mark.parametrize("stride", [2, 3])
+def test_transmission_is_invariant_to_dft_subsample(stride):
+    """``dft_subsample`` rescales the kept samples to match every-step recording.
+
+    Two detectors on the same plane in the same run may therefore differ only in cost, not in
+    the transmitted fraction they report.
+    """
+    objects, constraints, config, volume, wave = _build_base()
+    for name, subsample in (("every_step", 1), ("strided", stride)):
+        det = fdtdx.PhasorDetector(
+            name=name,
+            partial_grid_shape=(None, None, 1),
+            wave_characters=(wave,),
+            reduce_volume=False,
+            scaling_mode="pulse",
+            plot=False,
+            dft_subsample=subsample,
+        )
+        constraints.extend(
+            [
+                det.same_size(volume, axes=(0, 1)),
+                det.place_at_center(volume, axes=(0, 1)),
+                det.set_grid_coordinates(axes=(2,), sides=("-",), coordinates=(40,)),
+            ]
+        )
+        objects.append(det)
+    oc, arrays = _run(objects, constraints, config)
+
+    every_step = float(oc["every_step"].transmission(arrays, oc["source"])[0])
+    strided = float(oc["strided"].transmission(arrays, oc["source"])[0])
+    assert every_step == pytest.approx(1.0, abs=0.015), f"stride-1 transmission={every_step:.5f}"
+    assert strided / every_step == pytest.approx(1.0, rel=0.01), (
+        f"stride {stride}: T={strided:.5f} vs every-step T={every_step:.5f}"
+    )

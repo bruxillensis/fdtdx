@@ -178,6 +178,17 @@ class PhasorDetector(Detector):
             return self._dft_stride
         raise Exception(f"Invalid scaling mode: {self.scaling_mode=}")
 
+    def _raw_dft_scale(self) -> float:
+        """Factor by which the recorded phasors exceed the raw windowed-DFT sum.
+
+        Divide a recorded phasor by this to reach the convention
+        ``sum_n w[n] x[n] exp(i w n dt)`` that ``Source.injected_power_spectrum`` uses.
+        Only the *convention* part of ``_static_scale()`` is stripped: the ``dft_subsample``
+        stride in it compensates the thinned sum so it estimates the every-step sum, and must
+        be kept. In pulse mode the scale is the stride alone, so nothing is stripped.
+        """
+        return self._static_scale() / self._dft_stride
+
     def _phasor_factor(self, time_step: jax.Array) -> jax.Array:
         """Per-step windowed-DFT factor, shape ``(num_freqs,)``.
 
@@ -278,12 +289,12 @@ class PhasorDetector(Detector):
 
         axis = self._plane_normal_axis()
         area = self._face_area(axis)
-        static_scale = self._static_scale()
+        unscale = self._raw_dft_scale()
         num_freqs = phasor.shape[1]
 
         def flux_at(freq_index: jax.Array) -> jax.Array:
-            e_field = phasor[0, freq_index, :3] / static_scale
-            h_field = phasor[0, freq_index, 3:] / static_scale
+            e_field = phasor[0, freq_index, :3] / unscale
+            h_field = phasor[0, freq_index, 3:] / unscale
             poynting = compute_poynting_flux(e_field, h_field, axis=0)[axis]
             return 0.5 * jnp.real(jnp.sum(poynting * area))
 

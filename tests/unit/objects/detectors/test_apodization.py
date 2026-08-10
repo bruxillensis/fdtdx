@@ -191,3 +191,61 @@ def test_alpha_zero_tukey_is_identical_to_no_apodization(config):
 
     assert placed_a0._window_sum == pytest.approx(placed_rect._window_sum, rel=0, abs=0)
     np.testing.assert_array_equal(a0, rect)
+
+
+def _mid_taper_step(win, config):
+    """A time step inside the leading cosine taper of ``win``, where the weight is well under 1."""
+    step = int(0.125 * (config.time_steps_total - 1))  # centre of the alpha=0.5 leading taper
+    weight = float(win.get_window(jnp.array(step * config.time_step_duration)))
+    assert 0.1 < weight < 0.9, f"step {step} is not inside the taper (weight={weight})"
+    return step, weight
+
+
+def test_closed_surface_update_applies_the_window(config):
+    """The closed-surface update must window its samples, like the plane-detector update does.
+
+    It overrides ``PhasorDetector.update`` for hollow per-face storage; building the DFT factor
+    by hand there silently drops the window, so an accepted ``apodization`` does nothing while
+    ``transmission`` still forwards it to the source — leaving it in the denominator only.
+    """
+    from fdtdx.objects.detectors.poynting_flux import ClosedSurfacePhasorPoyntingFluxDetector
+
+    win = TukeyWindow(start_time=0.0, end_time=(config.time_steps_total - 1) * config.time_step_duration, alpha=0.5)
+    step, weight = _mid_taper_step(win, config)
+
+    def recorded_face(apodization):
+        det = ClosedSurfacePhasorPoyntingFluxDetector(
+            name="box",
+            wave_characters=(WaveCharacter(wavelength=1e-6),),
+            scaling_mode="pulse",  # static scale is 1 in both runs, so the ratio is the weight
+            apodization=apodization,
+        )
+        det = det.place_on_grid(((0, 4), (0, 4), (0, 4)), config, jax.random.PRNGKey(0))
+        ones = jnp.ones((3, 4, 4, 4))
+        state = det.update(jnp.array(step), ones, ones, det.init_state(), ones, 1.0)
+        return np.abs(np.asarray(state["phasor_axis2_max"]))
+
+    np.testing.assert_allclose(recorded_face(win), recorded_face(None) * weight, rtol=1e-5)
+
+
+def test_field_projection_box_update_applies_the_window(config):
+    """Same claim for the box-mode field-projection update, the other hand-rolled DFT factor."""
+    from fdtdx.objects.detectors.field_projection import FieldProjectionAngleDetector, _surface_state_key
+
+    win = TukeyWindow(start_time=0.0, end_time=(config.time_steps_total - 1) * config.time_step_duration, alpha=0.5)
+    step, weight = _mid_taper_step(win, config)
+
+    def recorded_face(apodization):
+        det = FieldProjectionAngleDetector(
+            name="proj",
+            wave_characters=(WaveCharacter(wavelength=1e-6),),
+            scaling_mode="pulse",
+            apodization=apodization,
+        )
+        det = det.place_on_grid(((0, 4), (0, 4), (0, 4)), config, jax.random.PRNGKey(0))
+        assert det._projection_mode == "box"
+        ones = jnp.ones((3, 4, 4, 4))
+        state = det.update(jnp.array(step), ones, ones, det.init_state(), ones, 1.0)
+        return np.abs(np.asarray(state[_surface_state_key("z+")]))
+
+    np.testing.assert_allclose(recorded_face(win), recorded_face(None) * weight, rtol=1e-5)
