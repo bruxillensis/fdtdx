@@ -270,6 +270,15 @@ class PhasorDetector(Detector):
         spacing = self._config.uniform_spacing()
         return jnp.ones(self.grid_shape, dtype=jnp.float32) * spacing * spacing
 
+    def _flux_sign(self) -> float:
+        """Sign convention for :meth:`flux_spectrum`: ``+1`` counts flux along the +normal axis.
+
+        Subclasses that carry their own normal (``direction``) override this, so every quantity
+        derived from the plane flux agrees with the orientation the user configured instead of
+        silently reporting the +normal one.
+        """
+        return 1.0
+
     def flux_spectrum(self, arrays: "ArrayContainer") -> jax.Array:
         """Net time-averaged Poynting flux through this plane detector, per frequency.
 
@@ -279,7 +288,8 @@ class PhasorDetector(Detector):
         (``Ex, Ey, Ez, Hx, Hy, Hz``) with ``reduce_volume=False``.
 
         Returns:
-            Real ``jax.Array`` of shape ``(num_freqs,)`` — net flux along the +normal axis.
+            Real ``jax.Array`` of shape ``(num_freqs,)`` — net flux along ``n̂``, which is the
+            +normal axis unless the detector defines a ``direction`` (see :meth:`_flux_sign`).
         """
         if self.reduce_volume:
             raise ValueError("flux_spectrum requires reduce_volume=False (it integrates over the plane).")
@@ -290,23 +300,19 @@ class PhasorDetector(Detector):
         axis = self._plane_normal_axis()
         area = self._face_area(axis)
         unscale = self._raw_dft_scale()
+        sign = self._flux_sign()
         num_freqs = phasor.shape[1]
 
         def flux_at(freq_index: jax.Array) -> jax.Array:
             e_field = phasor[0, freq_index, :3] / unscale
             h_field = phasor[0, freq_index, 3:] / unscale
             poynting = compute_poynting_flux(e_field, h_field, axis=0)[axis]
-            return 0.5 * jnp.real(jnp.sum(poynting * area))
+            return 0.5 * sign * jnp.real(jnp.sum(poynting * area))
 
         return jax.vmap(flux_at)(jnp.arange(num_freqs))
 
-    def measured_power_spectrum(
-        self,
-        arrays: "ArrayContainer",
-        frequencies: jax.Array | None = None,
-    ) -> jax.Array:
+    def measured_power_spectrum(self, arrays: "ArrayContainer") -> jax.Array:
         """Plane Poynting flux per frequency — the measured power for ``transmission``."""
-        del frequencies  # phasors are recorded at wave_characters; injected side uses those
         return self.flux_spectrum(arrays)
 
     def _injection_apodization(self):

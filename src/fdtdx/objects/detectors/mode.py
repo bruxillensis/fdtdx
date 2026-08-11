@@ -463,8 +463,6 @@ class BaseModeOverlapDetector(PhasorDetector, ABC):
         self,
         arrays: "ArrayContainer",
         source: "Source",
-        *,
-        frequencies: jax.Array | None = None,
     ) -> jax.Array:
         """Power fraction coupled into the reference mode(s): ``|overlap|^2 / injected``.
 
@@ -484,7 +482,6 @@ class BaseModeOverlapDetector(PhasorDetector, ABC):
         Args:
             arrays: Simulation arrays holding this detector's recorded state.
             source: The injecting source (must be post-``apply_params``).
-            frequencies: Optional frequencies (Hz); defaults to the detector's ``wave_characters``.
 
         Returns:
             Real ``jax.Array`` of shape ``(num_freqs,)`` — modal power fraction per frequency.
@@ -494,9 +491,7 @@ class BaseModeOverlapDetector(PhasorDetector, ABC):
                 "modal_transmission requires scaling_mode='pulse' so the modal power and the "
                 "source's injected_power_spectrum share the raw windowed-DFT convention."
             )
-        if frequencies is None:
-            frequencies = self._default_transmission_frequencies()
-        freqs = jnp.asarray(frequencies)
+        freqs = jnp.asarray(self._default_transmission_frequencies())
         state = arrays.detector_states[self.name]
         # compute_overlap returns the raw coefficient; in "pulse" scaling it omits the 1/4 Poynting
         # normalization (kept out so it cancels in S-parameter ratios). Re-apply it here so that

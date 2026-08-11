@@ -178,12 +178,35 @@ def test_transmitted_plus_reflected_power_is_conserved():
     objects.append(diel)
     _add_plane_phasor("out", 40, wave, volume, objects, constraints)
     _add_plane_phasor("back", 10, wave, volume, objects, constraints)  # upstream of the source
+    # Same plane as "back", but declaring which way it faces: a backward-facing monitor must
+    # report the reflected fraction directly, with no abs() at the call site.
+    back_dir = fdtdx.PhasorPoyntingFluxDetector(
+        name="back_dir",
+        partial_grid_shape=(None, None, 1),
+        wave_characters=(wave,),
+        direction="-",
+        scaling_mode="pulse",
+    )
+    constraints.extend(
+        [
+            back_dir.same_size(volume, axes=(0, 1)),
+            back_dir.place_at_center(volume, axes=(0, 1)),
+            back_dir.set_grid_coordinates(axes=(2,), sides=("-",), coordinates=(10,)),
+        ]
+    )
+    objects.append(back_dir)
     oc, arrays = _run(objects, constraints, config)
 
     injected = oc["source"].injected_power_spectrum(jnp.array([wave.get_frequency()]))
     t = float(oc["out"].transmission(arrays, oc["source"])[0])
     # The reflected branch travels -z, so its plane flux is negative; take the magnitude.
     r = abs(float(oc["back"].flux_spectrum(arrays)[0])) / float(injected[0])
+
+    # The direction="-" monitor gets there without the abs(): same plane, same field, and its
+    # sign convention already points upstream.
+    r_directional = float(oc["back_dir"].transmission(arrays, oc["source"])[0])
+    assert r_directional > 0, f"backward-facing monitor reported R={r_directional:.4f}"
+    assert r_directional == pytest.approx(r, rel=1e-4), f"directional R={r_directional:.5f} vs abs() R={r:.5f}"
 
     # Conservation is the tight claim here: T+R holds to ~0.4% at this resolution. R's own
     # absolute error is interface-discretization limited and converges as O(h) -- measured

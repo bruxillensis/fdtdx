@@ -12,6 +12,7 @@ from fdtdx.core.window import (
     gaussian_envelope,
     linear_rampup,
     tukey_envelope,
+    windowed_dft,
 )
 from fdtdx.objects.sources.profile import GaussianPulseProfile, SingleFrequencyProfile, TemporalProfile
 
@@ -133,3 +134,53 @@ class TestWindowValidation:
     def test_tukey_accepts_the_closed_unit_interval(self, alpha):
         win = TukeyWindow(start_time=0.0, end_time=1e-12, alpha=alpha)
         assert bool(jnp.all(jnp.isfinite(win.get_window(jnp.linspace(0, 1e-12, 20)))))
+
+
+class TestWindowedDFT:
+    """``windowed_dft`` is the spectrum the analytic source power is built on."""
+
+    @staticmethod
+    def _signal(n=32, seed=0):
+        return jnp.asarray(np.random.default_rng(seed).standard_normal(n), dtype=jnp.float32)
+
+    def test_matches_the_fft_at_exact_bins_under_a_flat_window(self):
+        """With w=1 at bin frequencies it is the conjugate FFT — its exponent is ``+i w t``."""
+        n = 32
+        dt = 1.0 / n  # so FFT bin k sits exactly at f = k
+        signal = self._signal(n)
+        got = np.asarray(windowed_dft(signal, jnp.ones(n), jnp.arange(6.0), dt))
+        expected = np.conj(np.fft.fft(np.asarray(signal, dtype=np.float64)))[:6]
+        np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-3)
+
+    def test_window_multiplies_the_signal(self):
+        """Weighting is exactly ``w * x``, not applied to the phase or the result."""
+        n, dt = 32, 1.0 / 32
+        signal = self._signal(n)
+        window = jnp.asarray(tukey_envelope(jnp.arange(n) * dt, 0.0, (n - 1) * dt, 0.5))
+        freqs = jnp.asarray([1.0, 2.5, 7.0])
+        np.testing.assert_allclose(
+            np.asarray(windowed_dft(signal, window, freqs, dt)),
+            np.asarray(windowed_dft(signal * window, jnp.ones(n), freqs, dt)),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+    def test_dc_term_is_the_weighted_sum(self):
+        """At f=0 every phase factor is 1, so the transform reduces to ``sum(w * x)``."""
+        n, dt = 32, 1.0 / 32
+        signal = self._signal(n)
+        window = jnp.asarray(tukey_envelope(jnp.arange(n) * dt, 0.0, (n - 1) * dt, 0.5))
+        dc = windowed_dft(signal, window, jnp.asarray([0.0]), dt)[0]
+        assert float(jnp.abs(jnp.imag(dc))) < 1e-4
+        assert float(jnp.real(dc)) == pytest.approx(float(jnp.sum(window * signal)), rel=1e-5)
+
+    def test_evaluates_between_fft_bins(self):
+        """The explicit sum exists so arbitrary (non-bin) frequencies can be requested."""
+        n, dt = 32, 1.0 / 32
+        signal = self._signal(n)
+        off_bin = windowed_dft(signal, jnp.ones(n), jnp.asarray([3.5]), dt)[0]
+        neighbours = np.asarray(windowed_dft(signal, jnp.ones(n), jnp.asarray([3.0, 4.0]), dt))
+        assert np.isfinite(complex(off_bin))
+        # A genuine interpolation point, not a silent snap to either neighbouring bin.
+        assert not np.isclose(complex(off_bin), neighbours[0], rtol=1e-3)
+        assert not np.isclose(complex(off_bin), neighbours[1], rtol=1e-3)

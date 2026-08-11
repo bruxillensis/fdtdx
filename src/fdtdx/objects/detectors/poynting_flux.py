@@ -361,6 +361,12 @@ class PhasorPoyntingFluxDetector(PhasorDetector):
         self = self.aset("_cached_face_area_weights", weights, create_new_ok=True)
         return self
 
+    def _flux_sign(self) -> float:
+        # This detector declares which way it faces, so flux_spectrum (and everything built on
+        # it -- measured_power_spectrum, transmission) uses the same sign compute_poynting_flux
+        # does. A direction="-" monitor therefore reports reflected power as positive.
+        return -1.0 if self.direction == "-" else 1.0
+
     def compute_poynting_flux(self, state: DetectorState) -> jax.Array:
         """Time-averaged Poynting flux through the plane at every recorded wavelength.
 
@@ -531,11 +537,7 @@ class ClosedSurfacePhasorPoyntingFluxDetector(PhasorDetector):
             net = 0.5 * net
         return net
 
-    def measured_power_spectrum(
-        self,
-        arrays: "ArrayContainer",
-        frequencies: jax.Array | None = None,
-    ) -> jax.Array:
+    def measured_power_spectrum(self, arrays: "ArrayContainer") -> jax.Array:
         """Net power through the closed surface per frequency — the measured power for
         :meth:`~fdtdx.Detector.transmission`.
 
@@ -549,7 +551,6 @@ class ClosedSurfacePhasorPoyntingFluxDetector(PhasorDetector):
         use ``compute_net_flux`` for the raw closed-surface value in this detector's own
         convention.
         """
-        del frequencies  # phasors are recorded at wave_characters
         # compute_net_flux keeps its own standalone convention: recorded phasors, with the 1/2
         # time average applied only in continuous mode (where phasors are peak amplitudes).
         # transmission() divides by a raw windowed-DFT injected power, so convert to the

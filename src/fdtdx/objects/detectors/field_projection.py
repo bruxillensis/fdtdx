@@ -251,6 +251,12 @@ class FieldProjectionDetectorBase(PhasorDetector):
         if len(exclude_surfaces) == len(_PROJECTION_SURFACES):
             raise ValueError("exclude_surfaces must not exclude every box surface.")
 
+    def _flux_sign(self) -> float:
+        # ``direction`` is this detector's declared outward normal, so the inherited
+        # flux_spectrum / transmission measure through that normal rather than the +axis one.
+        # A box projection has no single normal and keeps the base +normal convention.
+        return -1.0 if self.direction == "-" else 1.0
+
     @property
     def _projection_mode(self) -> Literal["surface", "box"]:
         """Classify the placed detector geometry as a single surface or a box volume."""

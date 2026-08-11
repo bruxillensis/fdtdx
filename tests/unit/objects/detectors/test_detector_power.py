@@ -175,3 +175,198 @@ def test_flux_spectrum_is_invariant_to_dft_subsample(stride):
     assert strided / every_step == pytest.approx(1.0, rel=1e-6), (
         f"stride={stride}: {strided:.6e} vs every-step {every_step:.6e}"
     )
+
+
+@pytest.mark.parametrize("direction,expected_sign", [("+", 1.0), ("-", -1.0)])
+def test_phasor_poynting_flux_spectrum_honors_direction(direction, expected_sign):
+    """``flux_spectrum`` must use the detector's own normal, as ``compute_poynting_flux`` does.
+
+    They read the same phasors on the same object, so a sign disagreement means
+    ``transmission`` (built on ``flux_spectrum``) contradicts the detector's own flux method.
+    """
+    import math
+
+    from fdtdx.objects.detectors.poynting_flux import PhasorPoyntingFluxDetector
+
+    config = SimulationConfig(time=1e-13, grid=UniformGrid(spacing=2e-7), backend="cpu")
+    det = PhasorPoyntingFluxDetector(
+        name="d", wave_characters=(WaveCharacter(wavelength=1e-6),), direction=direction, scaling_mode="pulse"
+    )
+    det = det.place_on_grid(((0, 4), (0, 4), (0, 1)), config, jax.random.PRNGKey(0))
+    # Forward +z plane wave (Ex=1, Hy=1): S_z = +1 per cell before the detector's own convention.
+    phasor = jnp.zeros((1, 1, 6, 4, 4, 1), dtype=jnp.complex64).at[0, 0, 0].set(1.0).at[0, 0, 4].set(1.0)
+
+    flux = float(det.flux_spectrum(_arrays_with_phasor("d", phasor))[0])
+    own = float(det.compute_poynting_flux({"phasor": phasor})[0])
+
+    assert math.copysign(1.0, flux) == expected_sign, f"direction={direction!r} gave flux={flux:.4e}"
+    assert math.copysign(1.0, flux) == math.copysign(1.0, own), (
+        f"flux_spectrum={flux:.4e} disagrees in sign with compute_poynting_flux={own:.4e}"
+    )
+    # Magnitude is unchanged by the sign convention. abs=0: this is ~3e-13, under approx's floor.
+    assert abs(flux) == pytest.approx(0.5 * (2e-7**2) * 16, rel=1e-5, abs=0)
+
+
+def test_backward_monitor_reports_a_backward_wave_as_positive():
+    """A ``direction="-"`` monitor is how you measure reflection; R must come out positive.
+
+    Without the direction convention the caller has to wrap the result in ``abs()``, which also
+    hides a genuinely wrong sign.
+    """
+    from fdtdx.objects.detectors.poynting_flux import PhasorPoyntingFluxDetector
+
+    config = SimulationConfig(time=1e-13, grid=UniformGrid(spacing=2e-7), backend="cpu")
+    det = PhasorPoyntingFluxDetector(
+        name="back", wave_characters=(WaveCharacter(wavelength=1e-6),), direction="-", scaling_mode="pulse"
+    )
+    det = det.place_on_grid(((0, 4), (0, 4), (0, 1)), config, jax.random.PRNGKey(0))
+    # Backward -z plane wave (Ex=1, Hy=-1): S_z = -1 per cell, i.e. +1 through this monitor.
+    phasor = jnp.zeros((1, 1, 6, 4, 4, 1), dtype=jnp.complex64).at[0, 0, 0].set(1.0).at[0, 0, 4].set(-1.0)
+    source_stub = types.SimpleNamespace(
+        injected_power_spectrum=lambda frequencies, apodization=None: jnp.full((len(frequencies),), 3.2e-13)
+    )
+
+    t = float(det.transmission(_arrays_with_phasor("back", phasor), source_stub)[0])
+    assert t > 0, f"backward monitor reported a negative fraction for a backward wave: {t:.4f}"
+    assert t == pytest.approx(1.0, rel=1e-5)
+
+
+def test_detector_without_a_spectrum_cannot_do_transmission():
+    """A detector that records no spectrum must say so, not fail obscurely downstream."""
+    from fdtdx.objects.detectors.field import FieldDetector
+
+    det = FieldDetector(name="f")
+    with pytest.raises(NotImplementedError, match="does not implement measured_power_spectrum"):
+        det.measured_power_spectrum(_arrays_with_phasor("f", jnp.zeros((1, 1, 6, 4, 4, 1), dtype=jnp.complex64)))
+    with pytest.raises(NotImplementedError, match="no frequency set"):
+        det._default_transmission_frequencies()
+    # No window to forward: only the phasor family carries an apodization.
+    assert det._injection_apodization() is None
+
+
+def test_flux_spectrum_rejects_reduce_volume():
+    """reduce_volume collapses the plane, so there is nothing left to integrate over."""
+    config = SimulationConfig(time=1e-13, grid=UniformGrid(spacing=2e-7), backend="cpu")
+    det = PhasorDetector(name="r", wave_characters=(WaveCharacter(wavelength=1e-6),), reduce_volume=True)
+    det = det.place_on_grid(((0, 4), (0, 4), (0, 1)), config, jax.random.PRNGKey(0))
+    with pytest.raises(ValueError, match="reduce_volume=False"):
+        det.flux_spectrum(_arrays_with_phasor("r", jnp.zeros((1, 1, 6), dtype=jnp.complex64)))
+
+
+def test_flux_spectrum_rejects_a_non_plane_detector():
+    """The surface integral needs exactly one singleton axis to define a normal."""
+    config = SimulationConfig(time=1e-13, grid=UniformGrid(spacing=2e-7), backend="cpu")
+    det = PhasorDetector(name="v", wave_characters=(WaveCharacter(wavelength=1e-6),), reduce_volume=False)
+    det = det.place_on_grid(((0, 4), (0, 4), (0, 4)), config, jax.random.PRNGKey(0))
+    with pytest.raises(ValueError, match="expects a plane detector"):
+        det.flux_spectrum(_arrays_with_phasor("v", jnp.zeros((1, 1, 6, 4, 4, 4), dtype=jnp.complex64)))
+
+
+def test_update_rejects_an_invalid_scaling_mode():
+    """The recording loop refuses a mode it has no scale for, rather than accumulating garbage."""
+    config = SimulationConfig(time=1e-13, grid=UniformGrid(spacing=2e-7), backend="cpu")
+    det = PhasorDetector(name="s", wave_characters=(WaveCharacter(wavelength=1e-6),), reduce_volume=False)
+    det = det.place_on_grid(((0, 4), (0, 4), (0, 1)), config, jax.random.PRNGKey(0))
+    det = det.aset("scaling_mode", "bogus")
+    fields = jnp.ones((3, 4, 4, 1))
+    with pytest.raises(Exception, match="Invalid scaling mode"):
+        det.update(jnp.array(0), fields, fields, det.init_state(), fields, 1.0)
+
+
+def test_flux_spectrum_uses_per_cell_areas_on_a_non_uniform_grid():
+    """On a resolved rectilinear grid the face area varies per cell and must be integrated as such.
+
+    The uniform fallback (``spacing**2`` everywhere) would silently mis-weight such a plane.
+    """
+    import fdtdx
+
+    spacing, ny = 2e-7, 4
+    config = SimulationConfig(
+        time=1e-13, grid=fdtdx.QuasiUniformGrid(dx=spacing, dy=spacing, dz=spacing), backend="cpu"
+    )
+    volume = fdtdx.SimulationVolume(partial_real_shape=(4 * spacing, ny * spacing, 4 * spacing))
+    det = fdtdx.PhasorDetector(
+        name="p",
+        partial_grid_shape=(None, None, 1),
+        wave_characters=(WaveCharacter(wavelength=1e-6),),
+        reduce_volume=False,
+        scaling_mode="pulse",
+    )
+    constraints = [
+        det.same_size(volume, axes=(0, 1)),
+        det.place_at_center(volume, axes=(0, 1)),
+        det.set_grid_coordinates(axes=(2,), sides=("-",), coordinates=(1,)),
+    ]
+    oc, _, _, config, _ = fdtdx.place_objects(
+        object_list=[volume, det], config=config, constraints=constraints, key=jax.random.PRNGKey(0)
+    )
+    assert config.resolved_grid is not None  # otherwise this exercises the uniform fallback
+    placed = oc["p"]
+
+    shape = placed.grid_shape
+    phasor = jnp.zeros((1, 1, 6, *shape), dtype=jnp.complex64).at[0, 0, 0].set(1.0).at[0, 0, 4].set(1.0)
+    flux = float(placed.flux_spectrum(_arrays_with_phasor("p", phasor))[0])
+    expected = 0.5 * float(jnp.sum(placed._face_area(2)))
+    assert flux == pytest.approx(expected, rel=1e-5, abs=0)
+
+
+def _constant_mode_function(*, coordinates, frequency, propagation_axis, inv_permittivity):
+    """A trivial reference mode: uniform E along axis 0, H along axis 1."""
+    del frequency, propagation_axis, inv_permittivity
+    amp = jnp.ones(coordinates[0].shape, dtype=jnp.float32)
+    mode_E = jnp.zeros((3, *amp.shape), dtype=jnp.float32).at[0].set(amp)
+    mode_H = jnp.zeros((3, *amp.shape), dtype=jnp.float32).at[1].set(amp)
+    return mode_E, mode_H
+
+
+def _applied_mode_detector(scaling_mode="pulse"):
+    from fdtdx.objects.detectors.mode import CustomModeOverlapDetector
+
+    config = SimulationConfig(time=1e-13, grid=UniformGrid(spacing=2e-7), backend="cpu")
+    det = CustomModeOverlapDetector(
+        name="m",
+        wave_characters=(WaveCharacter(wavelength=1e-6),),
+        mode_function=_constant_mode_function,
+        normalize=False,
+        scaling_mode=scaling_mode,
+    )
+    det = det.place_on_grid(((0, 4), (0, 4), (0, 1)), config, jax.random.PRNGKey(0))
+    det = det.apply(jax.random.PRNGKey(0), jnp.ones((3, 4, 4, 4), dtype=jnp.float32), 1.0)
+    return det
+
+
+def test_modal_transmission_requires_pulse_scaling():
+    """Continuous scaling puts the modal power in a different convention than the injected power."""
+    det = _applied_mode_detector(scaling_mode="continuous")
+    with pytest.raises(ValueError, match="requires scaling_mode='pulse'"):
+        det.modal_transmission(None, None)
+
+
+def test_modal_transmission_is_quadratic_in_the_recorded_field():
+    """Modal power is ``|overlap|^2``, so doubling the recorded phasor quadruples the fraction."""
+    det = _applied_mode_detector()
+    phasor = jnp.zeros((1, 1, 6, 4, 4, 1), dtype=jnp.complex64).at[0, 0, 0].set(1.0).at[0, 0, 4].set(1.0)
+    source_stub = types.SimpleNamespace(
+        injected_power_spectrum=lambda frequencies, apodization=None: jnp.full((len(frequencies),), 1e-12)
+    )
+
+    single = float(det.modal_transmission(_arrays_with_phasor("m", phasor), source_stub)[0])
+    double = float(det.modal_transmission(_arrays_with_phasor("m", 2 * phasor), source_stub)[0])
+    assert single > 0
+    assert double / single == pytest.approx(4.0, rel=1e-4)
+
+
+def test_modal_transmission_divides_by_the_injected_power():
+    """The injected power is the denominator, so twice the injection halves the fraction."""
+    det = _applied_mode_detector()
+    phasor = jnp.zeros((1, 1, 6, 4, 4, 1), dtype=jnp.complex64).at[0, 0, 0].set(1.0).at[0, 0, 4].set(1.0)
+    arrays = _arrays_with_phasor("m", phasor)
+
+    def stub(scale):
+        return types.SimpleNamespace(
+            injected_power_spectrum=lambda frequencies, apodization=None: jnp.full((len(frequencies),), scale)
+        )
+
+    weak = float(det.modal_transmission(arrays, stub(1e-12))[0])
+    strong = float(det.modal_transmission(arrays, stub(2e-12))[0])
+    assert strong / weak == pytest.approx(0.5, rel=1e-4)
