@@ -339,6 +339,12 @@ class Detector(SimulationObject, ABC):
         frequencies is meaningless. To measure elsewhere, put those frequencies in
         ``wave_characters`` and re-run.
 
+        The measured numerator is medium-agnostic — it integrates whatever fields were
+        recorded. The analytic denominator is not, so this ratio inherits every precondition of
+        ``source.injected_power_spectrum``; see
+        :meth:`~fdtdx.UniformPlaneSource.injected_power_spectrum` for the plane-source
+        restrictions (one injection plane, real spatial profile, lossless medium at the source).
+
         Args:
             arrays: Simulation arrays holding this detector's recorded state.
             source: The injecting source (must be post-``apply_params``).

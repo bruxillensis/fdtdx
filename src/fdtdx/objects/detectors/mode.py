@@ -479,6 +479,9 @@ class BaseModeOverlapDetector(PhasorDetector, ABC):
         the source's ``injected_power_spectrum`` share the raw windowed-DFT, eta0-normalized
         convention (the same one :meth:`~fdtdx.Detector.transmission` uses).
 
+        Shares the denominator of :meth:`~fdtdx.Detector.transmission` and therefore its
+        preconditions — see :meth:`~fdtdx.UniformPlaneSource.injected_power_spectrum`.
+
         Args:
             arrays: Simulation arrays holding this detector's recorded state.
             source: The injecting source (must be post-``apply_params``).

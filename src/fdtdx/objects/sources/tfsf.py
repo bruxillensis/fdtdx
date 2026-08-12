@@ -459,6 +459,21 @@ class TFSFPlaneSource(DirectionalPlaneSourceBase, ABC):
         and ``H(r,n)=_H(r)·s_H(n+δ_H(r))``, so the injected power factorizes into a temporal
         cross-spectrum and a spatial Poynting integral:
         ``P(f) = ½ Re[ Ŝ_E(f)·conj(Ŝ_H(f)) · G(f) ]``.
+
+        Preconditions, none of them checked:
+
+        * **One injection plane.** The spatial integral runs over a single face normal to
+          ``propagation_axis``. :class:`TFSFPlaneSourceRegion` injects on up to six faces and
+          never populates ``_E``/``_H``, so it hits the guard below and reports a misleading
+          "call apply_params" instead of an unsupported-geometry error.
+        * **Real spatial profile.** ``G(f)`` forms ``_E·_H`` without conjugating ``_H``, which
+          equals ``E x H*`` only for a real profile. A mode solved against a conductive
+          permittivity keeps a complex one, and the result then disagrees with the
+          detector-side convention (``compute_poynting_flux`` does conjugate) by roughly the
+          profile's imaginary fraction.
+        * **Lossless medium at the source plane.** ``_H`` is scaled by a real wave impedance
+          built from a permittivity that drops ``Im(ε)``, so the value is wrong wherever the
+          source plane sits in a conductive or lossy-dispersive medium.
         """
         if isinstance(self._E, Null) or isinstance(self._H, Null):
             raise Exception("Call apply_params on the source before injected_power_spectrum().")
